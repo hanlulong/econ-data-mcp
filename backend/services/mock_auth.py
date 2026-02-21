@@ -40,8 +40,15 @@ class MockAuthService:
         self.settings = get_settings()
         self.users: dict[str, MockUser] = {}
         self.tokens: dict[str, str] = {}  # token -> user_id mapping
-        # SECURITY: Only create test user when explicitly allowed
-        if os.getenv("ALLOW_TEST_USER", "").lower() == "true":
+        # SECURITY: In development/test, create a default test user unless explicitly disabled.
+        # In non-dev environments, require explicit ALLOW_TEST_USER=true.
+        allow_test_user_env = os.getenv("ALLOW_TEST_USER")
+        if allow_test_user_env is not None:
+            allow_test_user = allow_test_user_env.strip().lower() == "true"
+        else:
+            allow_test_user = bool(self.settings.dev_mode)
+
+        if allow_test_user:
             self._create_test_user()
         else:
             logger.info("⚠️  Mock auth initialized without test user (set ALLOW_TEST_USER=true to enable)")

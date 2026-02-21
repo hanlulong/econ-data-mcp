@@ -594,10 +594,15 @@ class FREDProvider(BaseProvider):
                     return parts[0], parts[1]
                 return mapping, None
 
-        # No static mapping found - return None to signal dynamic search should be tried
-        # This allows the async caller to attempt FRED series/search API
-        # Note: We no longer assume alphanumeric strings are valid series IDs.
-        # Dynamic search will find the correct series, or provide a helpful error.
+        # Backward-compatible explicit FRED code passthrough for code-like inputs.
+        # Keep this strict to avoid treating parser-style tokens (with underscores)
+        # as raw series IDs.
+        candidate = indicator.strip().upper()
+        if re.fullmatch(r"[A-Z0-9]{1,25}", candidate):
+            return candidate, None
+
+        # No static mapping found - return None to signal dynamic search should be tried.
+        # For non-code-like natural language inputs this keeps discovery general.
         return None, None
 
     async def _resolve_series_id_async(
@@ -865,4 +870,3 @@ class FREDProvider(BaseProvider):
             data_points = self._normalize_percentage_values(data_points, target_series, unit)
 
         return NormalizedData(metadata=metadata, data=data_points)
-

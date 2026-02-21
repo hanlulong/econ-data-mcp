@@ -26,6 +26,22 @@ class _FakeTranslator:
         return (None, None)
 
 
+class _FakeVectorResult:
+    def __init__(self, code: str, provider: str, name: str, similarity: float):
+        self.code = code
+        self.provider = provider
+        self.name = name
+        self.similarity = similarity
+
+
+class _FakeVectorService:
+    def __init__(self, results):
+        self._results = results
+
+    def search(self, query: str, limit: int = 10, where=None):
+        return self._results[:limit]
+
+
 class IndicatorResolverTests(unittest.TestCase):
     def test_prefers_lexically_relevant_result_over_higher_raw_score(self):
         lookup = _FakeLookup(
@@ -68,6 +84,23 @@ class IndicatorResolverTests(unittest.TestCase):
         result = resolver.resolve("galactic purchasing power", provider="FRED", use_cache=False)
 
         self.assertIsNone(result)
+
+    def test_single_term_lexical_match_is_not_overconfident(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "IC.CNS.TRAD.ZS",
+                    "provider": "WorldBank",
+                    "name": "Customs and trade regulations (% of managers surveyed)",
+                }
+            ]
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("custom indicator", provider="WorldBank", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertLess(result.confidence, 0.7)
 
     def test_exact_code_match_keeps_max_confidence(self):
         lookup = _FakeLookup(
@@ -256,6 +289,71 @@ class IndicatorResolverTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result.code, "NE.EXP.GNFS.ZS")
+
+    def test_fuzzy_matching_handles_import_typos_without_hardcoded_patch(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "NY.GDS.TOTL.ZS",
+                    "provider": "WorldBank",
+                    "name": "Gross domestic savings (% of GDP)",
+                },
+                {
+                    "code": "NE.EXP.GNFS.ZS",
+                    "provider": "WorldBank",
+                    "name": "Exports of goods and services (% of GDP)",
+                },
+                {
+                    "code": "NE.IMP.GNFS.ZS",
+                    "provider": "WorldBank",
+                    "name": "Imports of goods and services (% of GDP)",
+                },
+            ]
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("imprts share of gdp", provider="WorldBank", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "NE.IMP.GNFS.ZS")
+
+    def test_rrf_fusion_can_promote_vector_only_candidate(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "NY.GDS.TOTL.ZS",
+                    "provider": "WorldBank",
+                    "name": "Gross domestic savings (% of GDP)",
+                },
+                {
+                    "code": "NE.TRD.GNFS.ZS",
+                    "provider": "WorldBank",
+                    "name": "Trade (% of GDP)",
+                },
+            ],
+            exact_results={
+                ("WORLDBANK", "NE.IMP.GNFS.ZS"): {
+                    "code": "NE.IMP.GNFS.ZS",
+                    "provider": "WorldBank",
+                    "name": "Imports of goods and services (% of GDP)",
+                }
+            },
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+        resolver._use_hybrid_rerank = True
+        resolver._get_vector_service = lambda: _FakeVectorService([
+            _FakeVectorResult(
+                code="NE.IMP.GNFS.ZS",
+                provider="WORLDBANK",
+                name="Imports of goods and services (% of GDP)",
+                similarity=0.93,
+            )
+        ])
+
+        result = resolver.resolve("import share of gdp", provider="WorldBank", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "NE.IMP.GNFS.ZS")
 
 
 if __name__ == "__main__":

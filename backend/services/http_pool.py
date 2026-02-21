@@ -14,10 +14,11 @@ Performance improvement: 30-40% reduction in connection overhead
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 import httpx
 from typing import Optional, Dict, Any
-from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,16 @@ class HTTPClientPool:
     """
 
     _instance: Optional[HTTPClientPool] = None
-    _client: Optional[httpx.AsyncClient] = None
+    _loop_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = weakref.WeakKeyDictionary()
+    _sync_client: Optional[httpx.AsyncClient] = None
+    _MAX_CONNECTIONS = 100
+    _MAX_KEEPALIVE_CONNECTIONS = 50
+    _KEEPALIVE_EXPIRY = 5.0
+    _TOTAL_TIMEOUT = 30.0
+    _CONNECT_TIMEOUT = 10.0
+    _READ_TIMEOUT = 20.0
+    _WRITE_TIMEOUT = 10.0
+    _POOL_TIMEOUT = 5.0
 
     def __new__(cls) -> HTTPClientPool:
         if cls._instance is None:
@@ -44,31 +54,39 @@ class HTTPClientPool:
         return cls._instance
 
     def __init__(self):
-        """Initialize the HTTP client pool if not already done."""
-        if self._client is None:
-            self._initialize_client()
+        """Initialize singleton container (clients are created lazily)."""
+        pass
 
-    @staticmethod
-    def _initialize_client() -> None:
-        """Create a shared AsyncClient with optimized connection pooling."""
+    @classmethod
+    def _current_loop(cls) -> Optional[asyncio.AbstractEventLoop]:
+        """Return the current asyncio event loop, if available."""
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            # Called outside a running event loop (e.g., sync startup code).
+            return None
+
+    @classmethod
+    def _initialize_client(cls) -> httpx.AsyncClient:
+        """Create an AsyncClient with optimized connection pooling."""
         # Configure connection pool limits
         limits = httpx.Limits(
-            max_connections=100,  # Total concurrent connections
-            max_keepalive_connections=50,  # Keep-alive connections
-            keepalive_expiry=5.0,  # Keep connection alive for 5 seconds
+            max_connections=cls._MAX_CONNECTIONS,  # Total concurrent connections
+            max_keepalive_connections=cls._MAX_KEEPALIVE_CONNECTIONS,  # Keep-alive connections
+            keepalive_expiry=cls._KEEPALIVE_EXPIRY,  # Keep connection alive for 5 seconds
         )
 
         # Configure timeouts (total timeout, connect timeout)
         timeout = httpx.Timeout(
-            timeout=30.0,  # Total request timeout
-            connect=10.0,  # Connection establishment timeout
-            read=20.0,  # Read timeout
-            write=10.0,  # Write timeout
-            pool=5.0,  # Pool timeout
+            timeout=cls._TOTAL_TIMEOUT,  # Total request timeout
+            connect=cls._CONNECT_TIMEOUT,  # Connection establishment timeout
+            read=cls._READ_TIMEOUT,  # Read timeout
+            write=cls._WRITE_TIMEOUT,  # Write timeout
+            pool=cls._POOL_TIMEOUT,  # Pool timeout
         )
 
         # Create client with HTTP/2 support (if available)
-        HTTPClientPool._client = httpx.AsyncClient(
+        client = httpx.AsyncClient(
             limits=limits,
             timeout=timeout,
             http2=True,  # Enable HTTP/2
@@ -80,43 +98,82 @@ class HTTPClientPool:
             "HTTP Client Pool initialized: "
             "max_connections=100, max_keepalive=50, timeout=30s"
         )
+        return client
 
     @classmethod
     def get_client(cls) -> httpx.AsyncClient:
-        """Get the shared HTTP client instance."""
-        instance = cls()
-        if HTTPClientPool._client is None:
-            HTTPClientPool._initialize_client()
-        return HTTPClientPool._client
+        """Get a shared client scoped to the current event loop."""
+        cls()
+        loop = cls._current_loop()
+        if loop is None:
+            if cls._sync_client is None or cls._sync_client.is_closed:
+                cls._sync_client = cls._initialize_client()
+            return cls._sync_client
+
+        client = cls._loop_clients.get(loop)
+        if client is None or client.is_closed:
+            client = cls._initialize_client()
+            cls._loop_clients[loop] = client
+        return client
 
     @classmethod
     async def close(cls) -> None:
-        """Close the shared HTTP client pool."""
-        if HTTPClientPool._client:
-            await HTTPClientPool._client.aclose()
-            HTTPClientPool._client = None
-            logger.info("HTTP Client Pool closed")
+        """Close all shared HTTP clients across event loops."""
+        loop_clients = list(cls._loop_clients.values())
+        sync_client = cls._sync_client
+        if not loop_clients and sync_client is None:
+            return
+
+        cls._loop_clients = weakref.WeakKeyDictionary()
+        cls._sync_client = None
+
+        closed_ids = set()
+        all_clients = []
+        if sync_client is not None:
+            all_clients.append(sync_client)
+        all_clients.extend(loop_clients)
+
+        for client in all_clients:
+            if id(client) in closed_ids:
+                continue
+            closed_ids.add(id(client))
+            try:
+                await client.aclose()
+            except Exception as exc:  # pragma: no cover - defensive cleanup
+                logger.debug("Error closing HTTP client: %s", exc)
+        logger.info("HTTP Client Pool closed")
 
     @classmethod
     def get_stats(cls) -> Dict[str, Any]:
         """Get current pool statistics."""
-        client = cls.get_client()
+        loop = cls._current_loop()
+        client = cls._sync_client if loop is None else cls._loop_clients.get(loop)
+        if client is None and cls._sync_client and not cls._sync_client.is_closed:
+            client = cls._sync_client
+        if client is None:
+            client = next((c for c in cls._loop_clients.values() if c and not c.is_closed), None)
         if not client:
-            return {"status": "not_initialized"}
+            return {"status": "not_initialized", "active_clients": 0}
+
+        active_clients = 0
+        if cls._sync_client and not cls._sync_client.is_closed:
+            active_clients += 1
+        active_clients += sum(1 for c in cls._loop_clients.values() if not c.is_closed)
 
         return {
             "status": "active",
             "is_closed": client.is_closed,
+            "active_clients": active_clients,
             "timeout": {
-                "timeout": client.timeout.timeout,
-                "connect": client.timeout.connect,
-                "read": client.timeout.read,
-                "write": client.timeout.write,
+                "timeout": cls._TOTAL_TIMEOUT,
+                "connect": cls._CONNECT_TIMEOUT,
+                "read": cls._READ_TIMEOUT,
+                "write": cls._WRITE_TIMEOUT,
             },
             "limits": {
-                "max_connections": client.limits.max_connections,
-                "max_keepalive_connections": client.limits.max_keepalive_connections,
-                "keepalive_expiry": client.limits.keepalive_expiry,
+                "max_connections": cls._MAX_CONNECTIONS,
+                "max_keepalive_connections": cls._MAX_KEEPALIVE_CONNECTIONS,
+                "keepalive_expiry": cls._KEEPALIVE_EXPIRY,
             }
         }
 

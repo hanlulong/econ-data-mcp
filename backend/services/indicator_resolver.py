@@ -29,12 +29,14 @@ Date: 2025-12-27
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .indicator_lookup import IndicatorLookup, get_indicator_lookup
 from .indicator_translator import IndicatorTranslator, get_indicator_translator
+from .vector_search import VECTOR_SEARCH_AVAILABLE, get_vector_search_service
 from ..routing.country_resolver import CountryResolver
 from .catalog_service import (
     find_concept_by_term,
@@ -45,6 +47,11 @@ from .catalog_service import (
     get_best_provider,
     is_provider_available,
 )
+
+try:  # Optional dependency for typo-tolerant lexical matching
+    from rapidfuzz import fuzz
+except ImportError:  # pragma: no cover - optional at runtime
+    fuzz = None
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +117,22 @@ class IndicatorResolver:
             "improt": "import",
             "savngs": "savings",
         }
+        self._use_hybrid_rerank = os.getenv("USE_INDICATOR_HYBRID_RERANK", "true").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        try:
+            self._rrf_k = max(1, int(os.getenv("INDICATOR_RRF_K", "60")))
+        except ValueError:
+            self._rrf_k = 60
+        try:
+            self._vector_candidate_limit = max(
+                10,
+                int(os.getenv("INDICATOR_VECTOR_CANDIDATES", "40")),
+            )
+        except ValueError:
+            self._vector_candidate_limit = 40
+        self._vector_search_service = None
+        self._vector_search_checked = False
         # Remove country/location tokens from lexical matching so "in China and UK"
         # does not dilute indicator intent scoring.
         self._geo_terms: Set[str] = set()
@@ -210,6 +233,11 @@ class IndicatorResolver:
         # 4. Try FTS5 search in database (fallback for terms not in translator/catalog)
         if not result:
             search_results = self.lookup.search(query, provider=provider, limit=10)
+            search_results = self._fuse_semantic_candidates(
+                query=query,
+                provider=provider,
+                search_results=search_results,
+            )
             if search_results:
                 best, best_confidence = self._pick_best_search_result(
                     query,
@@ -424,6 +452,144 @@ class IndicatorResolver:
 
         return alternatives
 
+    @staticmethod
+    def _normalize_provider_key(provider: Optional[str]) -> str:
+        """Normalize provider strings across DB/vector sources."""
+        if not provider:
+            return ""
+        normalized = re.sub(r"[^A-Za-z0-9]+", "", str(provider).upper())
+        aliases = {
+            "WORLD BANK": "WORLDBANK",
+            "WORLDBANK": "WORLDBANK",
+            "STATSCAN": "STATSCAN",
+            "STATISTICSCANADA": "STATSCAN",
+            "EUROSTAT": "EUROSTAT",
+            "COINGECKO": "COINGECKO",
+            "EXCHANGERATE": "EXCHANGERATE",
+        }
+        return aliases.get(normalized, normalized)
+
+    def _get_vector_service(self):
+        """Lazily load vector search service if available and indexed."""
+        if not self._use_hybrid_rerank or not VECTOR_SEARCH_AVAILABLE:
+            return None
+        if self._vector_search_checked:
+            return self._vector_search_service
+
+        self._vector_search_checked = True
+        try:
+            service = get_vector_search_service()
+            if service and service.is_indexed():
+                self._vector_search_service = service
+            else:
+                logger.info("Vector search service available but no index found for hybrid reranking")
+        except Exception as exc:  # pragma: no cover - best-effort path
+            logger.warning("Hybrid vector reranking disabled (vector service unavailable): %s", exc)
+            self._vector_search_service = None
+        return self._vector_search_service
+
+    def _fuse_semantic_candidates(
+        self,
+        query: str,
+        provider: Optional[str],
+        search_results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Fuse lexical and semantic candidate ranks using Reciprocal Rank Fusion (RRF).
+
+        This is intentionally generic and non-provider-specific:
+        - lexical candidates come from SQLite FTS
+        - semantic candidates come from vector search
+        - RRF combines both without hardcoded phrase patches
+        """
+        if not search_results:
+            return search_results
+
+        vector_service = self._get_vector_service()
+        if not vector_service:
+            return search_results
+
+        provider_key = self._normalize_provider_key(provider)
+        where_filter = {"provider": provider_key} if provider_key else None
+
+        try:
+            vector_results = vector_service.search(
+                query,
+                limit=self._vector_candidate_limit,
+                where=where_filter,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort path
+            logger.debug("Vector search failed during hybrid rerank: %s", exc)
+            return search_results
+
+        if not vector_results:
+            return search_results
+
+        lexical_rank_by_code: Dict[str, int] = {}
+        candidate_by_code: Dict[str, Dict[str, Any]] = {}
+        for idx, candidate in enumerate(search_results, start=1):
+            code = self._normalize_code(candidate.get("code"))
+            if not code:
+                continue
+            lexical_rank_by_code[code] = idx
+            candidate_by_code[code] = dict(candidate)
+
+        semantic_rank_by_code: Dict[str, int] = {}
+        semantic_similarity_by_code: Dict[str, float] = {}
+        for idx, vector_candidate in enumerate(vector_results, start=1):
+            code = self._normalize_code(getattr(vector_candidate, "code", ""))
+            if not code:
+                continue
+
+            semantic_rank_by_code.setdefault(code, idx)
+            similarity = max(0.0, min(1.0, float(getattr(vector_candidate, "similarity", 0.0))))
+            semantic_similarity_by_code[code] = max(
+                similarity,
+                semantic_similarity_by_code.get(code, 0.0),
+            )
+
+            if code in candidate_by_code:
+                continue
+
+            # Promote vector-only candidates into ranking set when metadata exists.
+            vector_provider = getattr(vector_candidate, "provider", None)
+            metadata = self.lookup.get(vector_provider or provider or "", code)
+            if not metadata:
+                continue
+
+            if provider_key:
+                metadata_provider = self._normalize_provider_key(metadata.get("provider"))
+                if metadata_provider and metadata_provider != provider_key:
+                    continue
+
+            candidate_by_code[code] = dict(metadata)
+
+        if not semantic_rank_by_code:
+            return search_results
+
+        fused_candidates: List[Dict[str, Any]] = []
+        for code, candidate in candidate_by_code.items():
+            lexical_rank = lexical_rank_by_code.get(code)
+            semantic_rank = semantic_rank_by_code.get(code)
+            rrf_score = 0.0
+            if lexical_rank is not None:
+                rrf_score += 1.0 / (self._rrf_k + lexical_rank)
+            if semantic_rank is not None:
+                rrf_score += 1.0 / (self._rrf_k + semantic_rank)
+            if rrf_score <= 0.0:
+                continue
+
+            candidate["_rrf_score"] = rrf_score
+            candidate["_semantic_rank"] = semantic_rank
+            candidate["_semantic_similarity"] = semantic_similarity_by_code.get(code, 0.0)
+            fused_candidates.append(candidate)
+
+        if not fused_candidates:
+            return search_results
+
+        fused_candidates.sort(key=lambda c: c.get("_rrf_score", 0.0), reverse=True)
+        return fused_candidates
+
     def clear_cache(self):
         """Clear the resolution cache."""
         self._cache.clear()
@@ -496,31 +662,103 @@ class IndicatorResolver:
         if query_text and code and query_text in code.lower():
             phrase_bonus += 0.15
 
+        fuzzy_bonus = 0.0
+        fuzzy_value = 0.0
+        fuzzy_core_overlap_count = 0
+        fuzzy_core_name_overlap_count = 0
+        if fuzz is not None and query_text:
+            try:
+                fuzzy_value = fuzz.token_set_ratio(query_text, f"{name_lower} {description.lower()} {code.lower()}") / 100.0
+                # Keep bounded influence so lexical overlap still dominates.
+                fuzzy_bonus = max(0.0, min(0.14, 0.20 * fuzzy_value))
+
+                # Approximate core-term overlap for typo-heavy queries (e.g., "imprts").
+                for core_term in core_query_terms:
+                    if core_term in candidate_terms:
+                        fuzzy_core_overlap_count += 1
+                    else:
+                        best_candidate = max(
+                            (fuzz.ratio(core_term, candidate_term) for candidate_term in candidate_terms),
+                            default=0,
+                        )
+                        if best_candidate >= 86:
+                            fuzzy_core_overlap_count += 1
+
+                    if core_term in name_terms:
+                        fuzzy_core_name_overlap_count += 1
+                    else:
+                        best_name_term = max(
+                            (fuzz.ratio(core_term, name_term) for name_term in name_terms),
+                            default=0,
+                        )
+                        if best_name_term >= 86:
+                            fuzzy_core_name_overlap_count += 1
+            except Exception:  # pragma: no cover - optional runtime dependency path
+                fuzzy_bonus = 0.0
+
+        effective_core_overlap_count = max(core_overlap_count, fuzzy_core_overlap_count)
+        effective_core_name_overlap_count = max(core_name_overlap_count, fuzzy_core_name_overlap_count)
+        effective_core_overlap_ratio = effective_core_overlap_count / max(len(core_query_terms), 1)
+        effective_core_name_overlap_ratio = effective_core_name_overlap_count / max(len(core_query_terms), 1)
+
         # Slightly favor higher-ranked FTS results while keeping lexical fit primary.
         rank_bonus = max(0.0, 0.1 - (rank_index * 0.02))
+        semantic_similarity = float(candidate.get("_semantic_similarity") or 0.0)
+        semantic_bonus = max(0.0, min(0.12, semantic_similarity * 0.16))
 
         confidence = (
             0.05
             + (0.60 * overlap_ratio)
             + phrase_bonus
             + rank_bonus
-            + (0.25 * core_overlap_ratio)
-            + (0.15 * core_name_overlap_ratio)
+            + (0.25 * effective_core_overlap_ratio)
+            + (0.15 * effective_core_name_overlap_ratio)
+            + fuzzy_bonus
+            + semantic_bonus
         )
 
         # Strongly penalize candidates with zero lexical overlap.
         if overlap_count == 0 and (query_text not in name_lower) and (query_text not in code.lower()):
             confidence *= 0.2
         # Penalize candidates that miss all core terms in the query.
-        if core_query_terms and core_overlap_count == 0:
+        if core_query_terms and effective_core_overlap_count == 0:
             confidence -= 0.25
         # Prefer candidates where directional intent terms (export/import/etc.) appear in name/code.
         directional_core = core_query_terms & self._directional_terms
-        if directional_core and not (directional_core & name_terms):
-            confidence -= 0.12
+        if not directional_core and core_query_terms and fuzz is not None:
+            inferred_directionals: Set[str] = set()
+            for core_term in core_query_terms:
+                for directional in self._directional_terms:
+                    if fuzz.ratio(core_term, directional) >= 85:
+                        inferred_directionals.add(directional)
+            directional_core = inferred_directionals
+        if directional_core:
+            candidate_directionals = name_terms & self._directional_terms
+            if directional_core & name_terms:
+                confidence += 0.10
+            else:
+                # Strong penalty: explicit directional intent (import/export/etc.)
+                # should not resolve to generic ratio/trade candidates.
+                confidence -= 0.28
+                if candidate_directionals and not (candidate_directionals & directional_core):
+                    confidence -= 0.10
         # Mild penalty when core terms only appear in long descriptions.
-        if core_query_terms and core_overlap_count > 0 and core_name_overlap_count == 0:
+        if core_query_terms and effective_core_overlap_count > 0 and effective_core_name_overlap_count == 0:
             confidence -= 0.06
+
+        # Guardrail: single-term lexical hits are often semantically ambiguous
+        # (e.g., "custom indicator" matching "customs and trade ...").
+        # Keep confidence moderate unless we have an exact code or direct phrase match.
+        single_term_core_query = len(core_query_terms) <= 1
+        has_exact_code_match = bool(code and query_text == code.lower())
+        has_direct_phrase_match = bool(query_text and query_text in name_lower)
+        if (
+            single_term_core_query
+            and not directional_core
+            and not has_exact_code_match
+            and not has_direct_phrase_match
+        ):
+            confidence = min(confidence, 0.64)
 
         return max(0.0, min(1.0, confidence))
 

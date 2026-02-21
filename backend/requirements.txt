@@ -7,19 +7,27 @@ pydantic-settings>=2.2.1
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
 fastapi-mcp>=0.4.0
-pytest>=7.4.0
+pytest>=8.3.3,<9
 pytest-asyncio>=0.21.0
+pytest-env>=1.1.5,<1.2
 supabase>=2.0.0
 postgrest>=0.13.0
 
-# LangChain Integration (2025-12-24 - Upgraded to 1.2 + LangGraph 1.0.5 + Deep Agents)
-langchain>=1.2.0
-langchain-core>=1.2.5
-langchain-openai>=1.1.6
-langgraph>=1.0.5
+# LangChain/LangGraph Integration (2026-02-21 - refreshed to latest stable 1.2/1.0 line)
+langchain>=1.2.10
+langchain-core>=1.2.14
+langchain-openai>=1.1.10
+langgraph>=1.0.9
+langgraph-checkpoint>=4.0.0
+langgraph-prebuilt>=1.0.8
+langgraph-sdk>=0.3.8
 langsmith>=0.4.42
 tiktoken>=0.12.0
 faiss-cpu>=1.8.0
+sentence-transformers>=5.2.3
+rapidfuzz>=3.14.3
+semantic-router>=0.1.12
+litellm>=1.81.13
 deepagents>=0.3.1
 
 # Redis Integration (2025-11-22)

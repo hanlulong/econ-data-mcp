@@ -11,6 +11,11 @@ import asyncio
 import sys
 from pathlib import Path
 
+# This file is a manual diagnostic script, not an automated pytest unit test.
+if "pytest" in sys.modules:  # pragma: no cover - collection guard
+    import pytest
+    pytest.skip("manual SDMX fallback script (excluded from automated pytest run)", allow_module_level=True)
+
 # Add backend to path
 backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir.parent))

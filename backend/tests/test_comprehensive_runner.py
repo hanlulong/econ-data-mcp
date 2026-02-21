@@ -18,6 +18,11 @@ import httpx
 # Add backend to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+# This file is a manual benchmark runner, not an automated pytest unit test.
+if "pytest" in sys.modules:  # pragma: no cover - collection guard
+    import pytest
+    pytest.skip("manual benchmark runner (excluded from automated pytest run)", allow_module_level=True)
+
 
 @dataclass
 class TestResult:

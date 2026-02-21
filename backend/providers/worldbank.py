@@ -1063,24 +1063,6 @@ class WorldBankProvider(BaseProvider):
         if indicator and "." in indicator:
             return indicator
 
-        # INFRASTRUCTURE FIX: Check indicator database FIRST
-        # The database has 330K+ indicators with FTS5 search and subject/reference detection
-        # This is more reliable than the World Bank REST API search for abbreviations like M2
-        try:
-            from ..services.indicator_lookup import get_indicator_lookup
-            lookup = get_indicator_lookup()
-            results = lookup.search(indicator, provider='WorldBank', limit=5)
-
-            if results:
-                # Use the top-ranked result - it already applies subject/reference scoring
-                best = results[0]
-                code = best.get('code')
-                if code and best.get('_score', 0) > 20:  # Only use if score is confident
-                    logger.info(f"✅ Indicator database resolved WorldBank '{indicator}' → {code}")
-                    return code
-        except Exception as e:
-            logger.debug(f"Indicator database lookup failed: {e}")
-
         if not self.metadata_search:
             raise DataNotAvailableError(
                 f"WorldBank indicator '{indicator}' not recognized. Provide the official indicator code (e.g., NY.GDP.MKTP.CD) or enable metadata discovery."
