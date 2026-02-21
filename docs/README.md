@@ -4,9 +4,11 @@
 
 ## Quick Links
 
+- **[Public Quick Start](../README.md)** - 2 simple ways to use OpenEcon data (website or MCP)
 - **[Getting Started](guides/getting-started.md)** - First-time setup and basic usage
 - **[Cross-Platform Setup](guides/cross-platform-setup.md)** - Setup for Ubuntu/Linux, macOS, and Windows
 - **[MCP Setup (Claude Code + Codex)](mcp/setup.md)** - Add `econ-data-mcp` as an MCP server
+- **[Developer & Contributor Guide](development/DEVELOPER_CONTRIBUTOR_GUIDE.md)** - Technical setup, architecture, testing, deployment, contribution
 - **[API Quick Reference](providers/API_QUICK_REFERENCE.md)** - Quick reference for all supported APIs
 - **[Security Policy](../.github/SECURITY.md)** - Security features and best practices
 - **Hosted data app:** [https://data.openecon.io/chat](https://data.openecon.io/chat)
@@ -125,6 +127,7 @@ Guides for developers contributing to econ-data-mcp.
 
 | Document | Description |
 |----------|-------------|
+| [Developer & Contributor Guide](development/DEVELOPER_CONTRIBUTOR_GUIDE.md) | Technical setup and contribution workflow |
 | [LLM Abstraction](development/LLM_ABSTRACTION.md) | LLM provider abstraction layer |
 | [Metadata System](development/METADATA_SYSTEM_IMPROVEMENTS.md) | RAG-based metadata search |
 | [FAISS vs ChromaDB](development/FAISS_VS_CHROMADB_DECISION.md) | Vector search architecture decision |
