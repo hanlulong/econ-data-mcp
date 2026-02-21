@@ -105,6 +105,34 @@ class QueryServiceTests(unittest.TestCase):
         selected = self.service._select_indicator_query_for_resolution(intent)  # pylint: disable=protected-access
         self.assertEqual(selected, "import share of gdp China and US")
 
+    def test_worldbank_multi_indicator_collapses_to_resolved_code_after_override(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="World Bank",
+            indicators=[
+                "Gross PSD, Central Gov., All maturities, % of GDP",
+                "Gross PSD, Central Gov., All maturities, % of GDP",
+            ],
+            parameters={"countries": ["China", "US"]},
+            clarificationNeeded=False,
+            originalQuery="import share of gdp China and US",
+        )
+
+        class _Resolved:
+            code = "NE.IMP.GNFS.ZS"
+            confidence = 0.9
+            source = "database"
+
+        class _Resolver:
+            def resolve(self, query, provider=None):
+                return _Resolved()
+
+        with patch("backend.services.query.get_indicator_resolver", return_value=_Resolver()), \
+             patch.object(self.service.world_bank_provider, "fetch_indicator", return_value=[sample_series()]) as fetch_mock:
+            run(self.service._fetch_data(intent))  # pylint: disable=protected-access
+
+        self.assertEqual(intent.indicators, ["NE.IMP.GNFS.ZS"])
+        self.assertEqual(fetch_mock.call_args.kwargs.get("indicator"), "NE.IMP.GNFS.ZS")
+
 
 if __name__ == "__main__":
     unittest.main()

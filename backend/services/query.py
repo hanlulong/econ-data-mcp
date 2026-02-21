@@ -1465,10 +1465,27 @@ class QueryService:
             if provider in {"STATSCAN", "STATISTICS CANADA", "FRED", "IMF", "WORLDBANK", "EUROSTAT", "OECD", "BIS"}:
                 # Try IndicatorResolver first for enhanced resolution
                 indicator_query = self._select_indicator_query_for_resolution(intent)
+                original_query_text = str(intent.originalQuery or "").strip()
+                selected_original_override = (
+                    bool(original_query_text)
+                    and indicator_query == original_query_text
+                    and bool(intent.indicators)
+                    and indicator_query != str(intent.indicators[0] or "").strip()
+                )
                 resolved = resolver.resolve(indicator_query, provider=provider)
                 if resolved and resolved.confidence >= 0.7:
                     logger.info(f"🔍 IndicatorResolver: '{indicator_query}' → '{resolved.code}' (confidence: {resolved.confidence:.2f}, source: {resolved.source})")
                     params = {**params, "indicator": resolved.code}
+                    # World Bank fetch path can iterate raw intent.indicators when multiple
+                    # are present. If we intentionally overrode to original query for better
+                    # semantic alignment, collapse to the resolved indicator to avoid
+                    # reintroducing LLM-parsed mismatched indicators.
+                    if provider in {"WORLDBANK", "WORLD BANK"} and selected_original_override and len(intent.indicators) > 1:
+                        logger.info(
+                            "🔎 Collapsing World Bank multi-indicator intent to resolved indicator '%s' after semantic override",
+                            resolved.code,
+                        )
+                        intent.indicators = [resolved.code]
                 else:
                     # Fallback to original indicator
                     params = {**params, "indicator": indicator_query}
