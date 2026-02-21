@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi_mcp import FastApiMCP
+from starlette.types import ASGIApp, Receive, Scope, Send
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -187,67 +188,125 @@ def get_rate_limit_for_path(path: str) -> str:
 
 from limits import parse as parse_rate_limit
 
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
+class RateLimitASGIMiddleware:
     """
-    Custom rate limiting middleware that applies different limits per endpoint.
-    Uses the limits library for rate limit checking.
+    Pure ASGI rate limiting middleware.
+
+    Using pure ASGI avoids BaseHTTPMiddleware edge cases with SSE/MCP endpoints.
     """
-    path = request.url.path
 
-    # Skip rate limiting for health check, static files, and MCP endpoint
-    if path in ("/api/health", "/health") or path.startswith("/static") or path.startswith("/mcp"):
-        return await call_next(request)
+    def __init__(self, app: ASGIApp, settings_obj: Settings, limiter_obj: Limiter):
+        self.app = app
+        self.settings = settings_obj
+        self.limiter = limiter_obj
 
-    # Skip rate limiting in development mode
-    is_development = settings.environment != "production"
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
-    if is_development:
-        return await call_next(request)
+        request = Request(scope, receive=receive)
+        path = request.url.path
 
-    # In production, get real client IP from proxy headers
-    # Check X-Forwarded-For first (set by reverse proxies like Apache/nginx)
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        # X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
-        # The first IP is the original client
-        client_ip = forwarded_for.split(",")[0].strip()
-    else:
-        client_ip = get_remote_address(request)
+        # Skip rate limiting for health check, static files, and MCP endpoint
+        if path in ("/api/health", "/health") or path.startswith("/static") or path.startswith("/mcp"):
+            await self.app(scope, receive, send)
+            return
 
-    # Skip rate limiting for direct localhost connections (not proxied)
-    # SECURITY: Only bypass if X-Forwarded-For is absent (truly local connection)
-    # If X-Forwarded-For is present, the request came through a proxy
-    if not forwarded_for and client_ip in ("127.0.0.1", "::1", "localhost"):
-        return await call_next(request)
+        # Skip rate limiting in development mode
+        is_development = self.settings.environment != "production"
+        if is_development:
+            await self.app(scope, receive, send)
+            return
 
-    # Get the rate limit for this path
-    rate_limit_str = get_rate_limit_for_path(path)
+        # In production, get real client IP from proxy headers
+        forwarded_for = request.headers.get("X-Forwarded-For")
+        if forwarded_for:
+            client_ip = forwarded_for.split(",")[0].strip()
+        else:
+            client_ip = get_remote_address(request)
 
-    try:
-        # Use the client IP we already computed (with proxy header support)
-        # Create a rate limit check key specific to this endpoint
-        limit_key = f"{client_ip}:{path}"
+        # Skip rate limiting for direct localhost connections (not proxied)
+        if not forwarded_for and client_ip in ("127.0.0.1", "::1", "localhost"):
+            await self.app(scope, receive, send)
+            return
 
-        # Parse the rate limit string and check
-        rate_limit = parse_rate_limit(rate_limit_str)
-        if not limiter._limiter.hit(rate_limit, limit_key):
-            return JSONResponse(
-                status_code=429,
-                content={"detail": f"Rate limit exceeded. Limit: {rate_limit_str}"},
-                headers={"Retry-After": "60"}
+        rate_limit_str = get_rate_limit_for_path(path)
+
+        try:
+            limit_key = f"{client_ip}:{path}"
+            rate_limit = parse_rate_limit(rate_limit_str)
+
+            if not self.limiter._limiter.hit(rate_limit, limit_key):
+                response = JSONResponse(
+                    status_code=429,
+                    content={"detail": f"Rate limit exceeded. Limit: {rate_limit_str}"},
+                    headers={"Retry-After": "60"},
+                )
+                await response(scope, receive, send)
+                return
+
+            await self.app(scope, receive, send)
+            return
+        except Exception as e:
+            # SECURITY: Fail closed - deny request if rate limiter fails
+            logger.error(f"Rate limit check failed for {path} from {client_ip}: {e}")
+            response = JSONResponse(
+                status_code=503,
+                content={"detail": "Service temporarily unavailable. Please try again."},
+                headers={"Retry-After": "5"},
             )
+            await response(scope, receive, send)
+            return
 
-        return await call_next(request)
-    except Exception as e:
-        # SECURITY: Fail closed - deny request if rate limiter fails
-        # This prevents potential bypass attacks that could trigger exceptions
-        logger.error(f"Rate limit check failed for {path} from {client_ip}: {e}")
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Service temporarily unavailable. Please try again."},
-            headers={"Retry-After": "5"}
-        )
+
+class SecureLoggingASGIMiddleware:
+    """
+    Pure ASGI secure logging middleware.
+
+    Avoids BaseHTTPMiddleware protocol issues with MCP SSE transport.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = SecureLogger.generate_request_id()
+        scope.setdefault("state", {})
+        scope["state"]["request_id"] = request_id
+        start_time = time.perf_counter()
+
+        request = Request(scope, receive=receive)
+        request_log = SecureLogger.format_request_log(request, request_id)
+        log_secure("info", "Request received", request_log, request_id)
+
+        status_code = 500
+
+        async def send_wrapper(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message.get("status", 500)
+                headers = list(message.get("headers", []))
+                has_request_id = any(k.lower() == b"x-request-id" for k, _ in headers)
+                if not has_request_id:
+                    headers.append((b"x-request-id", request_id.encode("utf-8")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            response_log = SecureLogger.format_response_log(request_id, status_code, duration_ms)
+            log_secure("info", "Request completed", response_log, request_id)
+        except Exception as e:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            error_log = SecureLogger.format_error_log(request_id, e, include_traceback=True)
+            log_secure("error", "Request failed", error_log, request_id)
+            raise
 
 
 app.add_middleware(
@@ -257,6 +316,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RateLimitASGIMiddleware, settings_obj=settings, limiter_obj=limiter)
+app.add_middleware(SecureLoggingASGIMiddleware)
 
 
 # ====================
@@ -320,61 +381,6 @@ def save_to_user_history(
         timestamp=datetime.now(timezone.utc),
     )
     user_store.add_query_to_history(history_item)
-
-
-# Secure logging middleware with request tracing and PII redaction
-@app.middleware("http")
-async def secure_logging_middleware(request: Request, call_next):
-    """
-    Secure logging middleware with request tracing and PII redaction
-
-    Features:
-    - Generates unique request ID for distributed tracing
-    - Redacts sensitive headers and parameters
-    - Measures request duration
-    - Structured JSON logging
-    """
-    # Generate request ID for tracing
-    request_id = SecureLogger.generate_request_id()
-    request.state.request_id = request_id
-
-    # Record start time
-    start_time = time.perf_counter()
-
-    # Log sanitized request (without sensitive data)
-    request_log = SecureLogger.format_request_log(request, request_id)
-    log_secure("info", "Request received", request_log, request_id)
-
-    # Process request
-    try:
-        response = await call_next(request)
-
-        # Calculate duration
-        duration_ms = (time.perf_counter() - start_time) * 1000
-
-        # Log response
-        response_log = SecureLogger.format_response_log(
-            request_id,
-            response.status_code,
-            duration_ms
-        )
-        log_secure("info", "Request completed", response_log, request_id)
-
-        # Add request ID to response headers for client correlation
-        response.headers["X-Request-ID"] = request_id
-
-        return response
-
-    except Exception as e:
-        # Calculate duration even on error
-        duration_ms = (time.perf_counter() - start_time) * 1000
-
-        # Log error securely
-        error_log = SecureLogger.format_error_log(request_id, e, include_traceback=True)
-        log_secure("error", "Request failed", error_log, request_id)
-
-        # Re-raise the exception
-        raise
 
 
 async def _conversation_cleanup_loop() -> None:
