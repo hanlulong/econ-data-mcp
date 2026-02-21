@@ -3080,6 +3080,29 @@ class QueryService:
             query_result = result.get("result", {})
             data = query_result.get("data", [])
 
+            # Guardrail: if LangGraph returns data whose semantic cues do not
+            # match high-signal cues from the original query (e.g., import vs debt),
+            # retry through the standard deterministic path.
+            if data:
+                query_cues = self._extract_indicator_cues(query)
+                result_cues: set[str] = set()
+                for series in data:
+                    indicator_name = (
+                        series.metadata.indicator
+                        if series and getattr(series, "metadata", None)
+                        else ""
+                    )
+                    result_cues |= self._extract_indicator_cues(indicator_name)
+
+                if query_cues and not (query_cues & result_cues):
+                    logger.warning(
+                        "LangGraph semantic cue mismatch (query=%s, result=%s). "
+                        "Retrying via standard pipeline.",
+                        sorted(query_cues),
+                        sorted(result_cues),
+                    )
+                    return await self._standard_query_processing(query, conversation_id, tracker)
+
             # Check for empty data (silent failure case) - LangGraph specific
             if not data or (isinstance(data, list) and len(data) == 0):
                 # Try to get provider from multiple sources in LangGraph result
