@@ -8,6 +8,7 @@ from backend.routing.unified_router import RoutingDecision
 from backend.services.cache import cache_service
 from backend.services.query import QueryService
 from backend.tests.utils import run
+from backend.utils.retry import DataNotAvailableError
 
 
 def sample_series() -> NormalizedData:
@@ -334,6 +335,96 @@ class QueryServiceTests(unittest.TestCase):
         self.assertEqual(intent.apiProvider, "WorldBank")
         self.assertEqual(intent.parameters.get("indicator"), "EG.FEC.RNEW.ZS")
         self.assertEqual(wb_fetch.call_args.kwargs.get("indicator"), "EG.FEC.RNEW.ZS")
+
+    def test_is_fallback_relevant_uses_country_resolver_aliases(self) -> None:
+        series = sample_series()
+        series.metadata.country = "GB"
+        series.metadata.indicator = "Imports of goods and services (% of GDP)"
+
+        self.assertTrue(
+            self.service._is_fallback_relevant(  # pylint: disable=protected-access
+                ["imports of goods and services"],
+                [series],
+                target_countries=["UK"],
+            )
+        )
+
+    def test_is_fallback_relevant_rejects_country_mismatch_for_multi_country_queries(self) -> None:
+        series = sample_series()
+        series.metadata.country = "IN"
+        series.metadata.indicator = "Imports of goods and services (% of GDP)"
+
+        self.assertFalse(
+            self.service._is_fallback_relevant(  # pylint: disable=protected-access
+                ["imports of goods and services"],
+                [series],
+                target_countries=["China", "US"],
+            )
+        )
+
+    def test_try_with_fallback_sanitizes_provider_specific_indicator_params(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="IMF",
+            indicators=["imports of goods and services (% of GDP)"],
+            parameters={
+                "country": "CN",
+                "indicator": "BM_GDP",
+                "seriesId": "BM_GDP",
+                "startDate": "2020-01-01",
+                "endDate": "2024-01-01",
+            },
+            clarificationNeeded=False,
+            originalQuery="imports share of gdp in china",
+        )
+        captured_intent = {}
+
+        async def _fake_fetch_data(fallback_intent):
+            captured_intent["intent"] = fallback_intent
+            return [sample_series()]
+
+        with patch.object(self.service, "_get_fallback_providers", return_value=["WORLDBANK"]), \
+             patch.object(self.service, "_fetch_data", side_effect=_fake_fetch_data), \
+             patch.object(self.service, "_is_fallback_relevant", return_value=True):
+            result = run(
+                self.service._try_with_fallback(  # pylint: disable=protected-access
+                    intent,
+                    DataNotAvailableError("primary failed"),
+                )
+            )
+
+        self.assertEqual(len(result), 1)
+        fallback_intent = captured_intent["intent"]
+        self.assertEqual(fallback_intent.apiProvider, "WORLDBANK")
+        self.assertNotIn("indicator", fallback_intent.parameters)
+        self.assertNotIn("seriesId", fallback_intent.parameters)
+        self.assertEqual(intent.parameters.get("indicator"), "BM_GDP")
+        self.assertEqual(intent.parameters.get("seriesId"), "BM_GDP")
+
+    def test_get_fallback_providers_passes_country_context_to_resolver(self) -> None:
+        class _Resolved:
+            confidence = 0.8
+
+        class _Resolver:
+            def __init__(self):
+                self.calls = []
+
+            def resolve(self, *args, **kwargs):
+                self.calls.append(kwargs)
+                return _Resolved()
+
+        resolver = _Resolver()
+        with patch("backend.services.indicator_resolver.get_indicator_resolver", return_value=resolver):
+            _ = self.service._get_fallback_providers(  # pylint: disable=protected-access
+                "IMF",
+                indicator="imports",
+                country="CN",
+                countries=["CN", "GB"],
+            )
+
+        self.assertTrue(resolver.calls)
+        first_call = resolver.calls[0]
+        self.assertEqual(first_call.get("country"), "CN")
+        self.assertEqual(first_call.get("countries"), ["CN", "GB"])
 
 
 if __name__ == "__main__":

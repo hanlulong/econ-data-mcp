@@ -731,7 +731,51 @@ class QueryService:
         cache_service.cache_data(provider, cache_params, data)
         logger.debug(f"Saved to in-memory cache: {provider}")
 
-    def _get_fallback_providers(self, primary_provider: str, indicator: Optional[str] = None) -> List[str]:
+    def _collect_target_countries(self, parameters: Optional[dict]) -> List[str]:
+        """Extract ordered country context from query parameters."""
+        if not parameters:
+            return []
+
+        countries: List[str] = []
+        raw_countries = parameters.get("countries")
+        if isinstance(raw_countries, list):
+            countries.extend(str(country) for country in raw_countries if country)
+
+        raw_country = parameters.get("country")
+        if raw_country:
+            countries.append(str(raw_country))
+
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(countries))
+
+    @staticmethod
+    def _normalize_country_to_iso2(country: Optional[str]) -> Optional[str]:
+        """Normalize country identifiers/names to ISO2 codes when possible."""
+        if not country:
+            return None
+
+        country_text = str(country).strip()
+        if not country_text:
+            return None
+
+        normalized = CountryResolver.normalize(country_text)
+        if normalized:
+            return normalized
+
+        # Allow ISO3 inputs (e.g., GBR) and normalize to ISO2 when known.
+        iso2 = CountryResolver.to_iso2(country_text.upper())
+        if iso2:
+            return iso2
+
+        return None
+
+    def _get_fallback_providers(
+        self,
+        primary_provider: str,
+        indicator: Optional[str] = None,
+        country: Optional[str] = None,
+        countries: Optional[List[str]] = None,
+    ) -> List[str]:
         """
         Get ordered list of fallback providers for a given primary provider.
 
@@ -746,6 +790,8 @@ class QueryService:
         Args:
             primary_provider: The primary provider that failed
             indicator: Optional indicator name for smarter fallbacks
+            country: Optional single-country context
+            countries: Optional multi-country context
 
         Returns:
             List of fallback provider names to try in order
@@ -767,6 +813,10 @@ class QueryService:
             if provider_name and provider_name != primary_upper
         ]
 
+        context_countries = [str(c) for c in (countries or []) if c]
+        if country and str(country) not in context_countries:
+            context_countries.append(str(country))
+
         # INFRASTRUCTURE FIX: Use IndicatorResolver to find providers that have this indicator
         # This searches the 330K+ indicator database for actual matches
         if indicator:
@@ -786,8 +836,8 @@ class QueryService:
                     resolved = resolver.resolve(
                         indicator,
                         provider=provider,
-                        country=None,
-                        countries=None,
+                        country=country,
+                        countries=context_countries or None,
                     )
                     if resolved and resolved.confidence >= 0.6:
                         indicator_fallbacks.append((provider, resolved.confidence))
@@ -920,8 +970,10 @@ class QueryService:
         return "\n".join(suggestions)
 
     def _is_fallback_relevant(
-        self, original_indicators: List[str], fallback_result: List[NormalizedData],
-        target_country: Optional[str] = None
+        self,
+        original_indicators: List[str],
+        fallback_result: List[NormalizedData],
+        target_countries: Optional[List[str]] = None,
     ) -> bool:
         """
         Check if fallback result is semantically related to the original query.
@@ -939,7 +991,7 @@ class QueryService:
         Args:
             original_indicators: Original indicator names from user query
             fallback_result: Data returned from fallback provider
-            target_country: Optional country the query is targeting
+            target_countries: Optional countries the query is targeting
 
         Returns:
             True if fallback data is relevant, False otherwise
@@ -947,50 +999,45 @@ class QueryService:
         if not fallback_result or not original_indicators:
             return False
 
-        # INFRASTRUCTURE FIX: Country validation
-        # Reject data that is for a different country than requested
-        if target_country:
-            target_upper = target_country.upper()
-            # Normalize country names for comparison
-            country_aliases = {
-                'CANADA': ['CANADA', 'CA', 'CAN'],
-                'UNITED STATES': ['UNITED STATES', 'US', 'USA', 'AMERICA'],
-                'GERMANY': ['GERMANY', 'DE', 'DEU'],
-                'FRANCE': ['FRANCE', 'FR', 'FRA'],
-                'UNITED KINGDOM': ['UNITED KINGDOM', 'UK', 'GB', 'GBR', 'BRITAIN'],
-                'JAPAN': ['JAPAN', 'JP', 'JPN'],
-                'CHINA': ['CHINA', 'CN', 'CHN'],
-                'INDIA': ['INDIA', 'IN', 'IND'],
-            }
-
-            # Find canonical name for target country
-            target_canonical = target_upper
-            for canonical, aliases in country_aliases.items():
-                if target_upper in aliases:
-                    target_canonical = canonical
-                    target_aliases = set(aliases)
-                    break
-            else:
-                target_aliases = {target_upper}
-
-            # Check each result for country match
+        # Country validation (generalized): enforce match for known ISO2 country contexts.
+        requested_iso2 = {
+            iso2
+            for iso2 in (
+                self._normalize_country_to_iso2(country)
+                for country in (target_countries or [])
+            )
+            if iso2
+        }
+        if requested_iso2:
+            saw_normalized_country = False
+            matched_requested_country = False
             for data in fallback_result:
-                if data.metadata and data.metadata.country:
-                    result_country = data.metadata.country.upper()
-                    # Find canonical name for result country
-                    result_canonical = result_country
-                    for canonical, aliases in country_aliases.items():
-                        if result_country in aliases:
-                            result_canonical = canonical
-                            break
+                if not data.metadata or not data.metadata.country:
+                    continue
 
-                    # If countries don't match, reject the fallback
-                    if target_canonical != result_canonical and result_country not in target_aliases:
-                        logger.warning(
-                            f"Fallback rejected: country mismatch - "
-                            f"requested '{target_country}' but got '{data.metadata.country}'"
-                        )
-                        return False
+                result_country = data.metadata.country
+                result_iso2 = self._normalize_country_to_iso2(result_country)
+                if not result_iso2:
+                    continue
+
+                saw_normalized_country = True
+                if result_iso2 in requested_iso2:
+                    matched_requested_country = True
+                    continue
+
+                logger.warning(
+                    "Fallback rejected: country mismatch - requested=%s got=%s",
+                    sorted(requested_iso2),
+                    result_country,
+                )
+                return False
+
+            if saw_normalized_country and not matched_requested_country:
+                logger.warning(
+                    "Fallback rejected: none of the fallback result countries matched requested=%s",
+                    sorted(requested_iso2),
+                )
+                return False
 
         # Define subject entities (who/what the data is about)
         subject_entities = {
@@ -1151,7 +1198,14 @@ class QueryService:
         primary_provider = normalize_provider_name(intent.apiProvider)
         # Get indicator for smarter fallbacks
         indicator = intent.indicators[0] if intent.indicators else None
-        fallback_providers = self._get_fallback_providers(primary_provider, indicator)
+        target_countries = self._collect_target_countries(intent.parameters)
+        target_country = target_countries[0] if target_countries else None
+        fallback_providers = self._get_fallback_providers(
+            primary_provider,
+            indicator,
+            country=target_country,
+            countries=target_countries,
+        )
 
         if not fallback_providers:
             raise primary_error
@@ -1160,21 +1214,39 @@ class QueryService:
         for fallback_provider in fallback_providers:
             logger.warning(f"Attempting fallback from {primary_provider} to {fallback_provider}")
 
+            fallback_params = dict(intent.parameters or {})
+            # Remove provider-specific resolved indicator identifiers so fallback
+            # providers can resolve indicator codes in their own namespace.
+            fallback_params.pop("indicator", None)
+            fallback_params.pop("seriesId", None)
+            fallback_params.pop("series_id", None)
+            fallback_params.pop("code", None)
+
+            fallback_indicators = list(intent.indicators or [])
+            fallback_indicator_query = self._select_indicator_query_for_resolution(intent)
+            if fallback_indicator_query:
+                if not fallback_indicators:
+                    fallback_indicators = [fallback_indicator_query]
+                elif len(fallback_indicators) == 1:
+                    existing_indicator = str(fallback_indicators[0] or "").strip().lower()
+                    current_param_indicator = str((intent.parameters or {}).get("indicator") or "").strip().lower()
+                    if existing_indicator and current_param_indicator and existing_indicator == current_param_indicator:
+                        fallback_indicators = [fallback_indicator_query]
+
             # Create a modified intent for the fallback provider
             fallback_intent = ParsedIntent(
                 apiProvider=fallback_provider,
-                indicators=intent.indicators,
-                parameters=intent.parameters,
-                clarificationNeeded=False
+                indicators=fallback_indicators,
+                parameters=fallback_params,
+                clarificationNeeded=False,
+                originalQuery=intent.originalQuery,
             )
 
             try:
                 result = await self._fetch_data(fallback_intent)
 
                 # Validate fallback result is semantically related to original query
-                # INFRASTRUCTURE FIX: Pass target country for country-aware validation
-                target_country = intent.parameters.get("country") if intent.parameters else None
-                if result and self._is_fallback_relevant(intent.indicators, result, target_country):
+                if result and self._is_fallback_relevant(intent.indicators, result, target_countries):
                     logger.info(f"✅ Fallback to {fallback_provider} succeeded")
                     return result
                 else:

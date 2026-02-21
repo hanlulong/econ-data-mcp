@@ -106,7 +106,7 @@ class MetadataSearchService:
         # Check cache first
         cache_key = f"sdmx_search:{keyword.lower()}:{provider_filter or 'all'}"
         cached = cache_service.get(cache_key)
-        if cached:
+        if cached is not None:
             logger.info(f"Cache hit for SDMX search: {keyword} ({len(cached)} results)")
             tracker = get_processing_tracker()
             if tracker:
@@ -141,8 +141,10 @@ class MetadataSearchService:
                     continue
 
                 for flow_id, flow_info in dataflows.items():
-                    name = flow_info.get('name', '').lower()
-                    description = flow_info.get('description', '').lower()
+                    if not isinstance(flow_info, dict):
+                        continue
+                    name = str(flow_info.get('name') or '').lower()
+                    description = str(flow_info.get('description') or '').lower()
                     combined = f"{name} {description}"
 
                     # Match if ALL keywords appear in name or description
@@ -154,8 +156,8 @@ class MetadataSearchService:
                             'provider': provider,
                             'code': flow_id,
                             'id': flow_id,
-                            'name': flow_info.get('name', ''),
-                            'description': flow_info.get('description', ''),
+                            'name': str(flow_info.get('name') or ''),
+                            'description': str(flow_info.get('description') or ''),
                             'source': 'SDMX',
                         }
 

@@ -11,8 +11,8 @@ import json
 import logging
 import hashlib
 from typing import Any, Optional, Dict
-from datetime import timedelta
 import asyncio
+from pydantic import BaseModel
 
 try:
     import redis.asyncio as redis
@@ -23,6 +23,7 @@ except ImportError:
     REDIS_AVAILABLE = False
 
 from ..config import get_settings
+from ..models import NormalizedData
 from .cache import CacheService  # Fallback to in-memory cache
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,41 @@ class RedisCacheService:
             "default": 3600        # 1 hour default
         }
 
+    @staticmethod
+    def _to_jsonable(payload: Any) -> Any:
+        """Recursively convert payloads into JSON-serializable structures."""
+        if isinstance(payload, BaseModel):
+            return payload.model_dump(mode="json")
+        if isinstance(payload, list):
+            return [RedisCacheService._to_jsonable(item) for item in payload]
+        if isinstance(payload, tuple):
+            return [RedisCacheService._to_jsonable(item) for item in payload]
+        if isinstance(payload, dict):
+            return {
+                str(key): RedisCacheService._to_jsonable(value)
+                for key, value in payload.items()
+            }
+        return payload
+
+    @staticmethod
+    def _restore_cached_payload(payload: Any) -> Any:
+        """Best-effort restoration of normalized data models from cached JSON."""
+        if isinstance(payload, list):
+            return [RedisCacheService._restore_cached_payload(item) for item in payload]
+
+        if isinstance(payload, dict):
+            if "metadata" in payload and "data" in payload:
+                try:
+                    return NormalizedData.model_validate(payload)
+                except Exception:
+                    pass
+            return {
+                key: RedisCacheService._restore_cached_payload(value)
+                for key, value in payload.items()
+            }
+
+        return payload
+
     async def connect(self) -> bool:
         """
         Connect to Redis server with retry logic.
@@ -83,7 +119,11 @@ class RedisCacheService:
 
             try:
                 # Get Redis configuration from environment
-                redis_url = getattr(self.settings, 'REDIS_URL', None) or 'redis://localhost:6379/0'
+                redis_url = (
+                    getattr(self.settings, "redis_url", None)
+                    or getattr(self.settings, "REDIS_URL", None)
+                    or 'redis://localhost:6379/0'
+                )
 
                 # Create connection with retry logic
                 retry = Retry(ExponentialBackoff(), 3)
@@ -167,7 +207,7 @@ class RedisCacheService:
                 data = await self.redis_client.get(key)
                 if data:
                     logger.debug(f"🎯 Redis cache hit for {provider}: {query[:50]}...")
-                    return json.loads(data)
+                    return self._restore_cached_payload(json.loads(data))
             except Exception as e:
                 logger.warning(f"Redis get error: {e}. Falling back to in-memory cache.")
                 self._connected = False  # Mark as disconnected for reconnection attempt
@@ -202,7 +242,7 @@ class RedisCacheService:
         success = False
         if self._connected and self.redis_client:
             try:
-                serialized = json.dumps(data)
+                serialized = json.dumps(self._to_jsonable(data), default=str)
                 await self.redis_client.setex(key, ttl, serialized)
                 logger.debug(f"✅ Cached to Redis: {provider} query (TTL: {ttl}s)")
                 success = True
@@ -277,6 +317,31 @@ class RedisCacheService:
 
         return deleted
 
+    async def clear_all(self) -> int:
+        """
+        Clear all OpenEcon cache entries from Redis and in-memory fallback cache.
+
+        Returns:
+            Number of Redis keys deleted (0 when Redis unavailable).
+        """
+        deleted = 0
+
+        if self._connected and self.redis_client:
+            try:
+                cursor = 0
+                while True:
+                    cursor, keys = await self.redis_client.scan(cursor, match="openecon:*", count=200)
+                    if keys:
+                        deleted += await self.redis_client.delete(*keys)
+                    if cursor == 0:
+                        break
+                logger.info(f"🧹 Cleared {deleted} Redis cache entries for OpenEcon")
+            except Exception as e:
+                logger.error(f"Error clearing Redis cache: {e}")
+
+        self.fallback_cache.clear()
+        return deleted
+
     async def get_stats(self) -> Dict[str, Any]:
         """
         Get cache statistics.
@@ -286,7 +351,7 @@ class RedisCacheService:
         """
         stats = {
             "redis_connected": self._connected,
-            "in_memory_stats": self.fallback_cache.stats()
+            "in_memory_stats": self.fallback_cache.get_stats()
         }
 
         if self._connected and self.redis_client:
