@@ -9,8 +9,10 @@ class _FakeDB:
     def __init__(self):
         self.last_search_provider = None
         self.last_get_provider = None
+        self.last_search_query = None
 
     def search(self, query, provider=None, category=None, limit=20):
+        self.last_search_query = query
         self.last_search_provider = provider
         return []
 
@@ -37,7 +39,13 @@ class IndicatorLookupTests(unittest.TestCase):
         lookup.get("EXCHANGERATE", "USD")
         self.assertEqual(db.last_get_provider, "ExchangeRate")
 
+    def test_search_normalizes_machine_style_query_tokens(self):
+        db = _FakeDB()
+        lookup = IndicatorLookup(db=db)
+
+        lookup.search("EXPORT_TO_GDP_RATIO", provider="WORLDBANK")
+        self.assertEqual(db.last_search_query, "export gdp gross domestic product ratio")
+
 
 if __name__ == "__main__":
     unittest.main()
-

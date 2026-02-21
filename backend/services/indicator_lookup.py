@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .indicator_database import IndicatorDatabase, get_indicator_database
@@ -210,6 +211,10 @@ class IndicatorLookup:
         """Normalize query for search."""
         # Lowercase and strip
         query = query.lower().strip()
+        # Normalize common machine-style separators to plain tokens.
+        # This makes parser outputs like EXPORT_TO_GDP_RATIO searchable.
+        query = re.sub(r"[_/\-]+", " ", query)
+        query = re.sub(r"\\s+", " ", query).strip()
 
         # Remove common noise words
         noise = ["the", "a", "an", "of", "for", "in", "to", "and", "or", "show", "get", "find"]
