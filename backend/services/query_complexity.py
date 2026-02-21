@@ -427,7 +427,7 @@ class QueryComplexityAnalyzer:
             message_parts.append(f"**Example**: {limitation['example']}")
 
         # === ADD PRO MODE RECOMMENDATION ===
-        if analysis['pro_mode_recommended'] and not limitation:
+        if analysis.get('pro_mode_recommended', False) and not limitation:
             message_parts.append("")
             message_parts.append("**💡 This query appears complex.**")
             message_parts.append("Try using **Pro Mode** for:")

@@ -30,6 +30,7 @@ from ..config import get_settings
 from ..models import NormalizedData, ParsedIntent
 from ..utils.retry import retry_async, DataNotAvailableError
 from .parameter_mapper import ParameterMapper
+from .time_range_defaults import apply_default_time_range
 from ..routing.country_resolver import CountryResolver
 
 # Import new agent architecture
@@ -49,102 +50,6 @@ def get_state_manager() -> ConversationStateManager:
     """Get the global state manager singleton from the memory module."""
     from ..memory.state_manager import conversation_state_manager
     return conversation_state_manager
-
-
-def apply_default_time_range(
-    provider: str,
-    routing: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Apply smart default time ranges based on provider when user doesn't specify time period.
-
-    Rules:
-    - If user specified dates, always respect their request (don't override)
-    - Exchange Rate / CoinGecko: Default to last 3 months (high-frequency data)
-    - UN Comtrade: Default to last 10 years (annual trade data)
-    - Other providers: No default (return all available data)
-
-    Special handling:
-    - For Comtrade: Override LLM-generated 5-year defaults with 10-year default
-
-    Args:
-        provider: The data provider name (uppercase)
-        routing: The routing dictionary containing startDate and endDate
-
-    Returns:
-        Updated routing dictionary with default dates if applicable
-    """
-    from datetime import datetime, timedelta
-
-    provider_upper = provider.upper()
-    today = datetime.now()
-
-    # Check if user already specified dates
-    start_date = routing.get("startDate")
-    end_date = routing.get("endDate")
-
-    # Special handling for Comtrade: detect and override LLM-generated defaults
-    # LLMs often default to "last 5 years" even when told not to
-    if provider_upper == "COMTRADE":
-        should_apply_default = False
-
-        if not start_date and not end_date:
-            # No dates specified - apply default
-            should_apply_default = True
-        elif start_date:
-            # Check if this looks like an LLM-generated default (~5 years)
-            try:
-                start_year = int(start_date[:4])
-                years_ago = today.year - start_year
-                # If it's approximately 5 years (4-6 years range), it's likely an LLM default
-                if 4 <= years_ago <= 6:
-                    logger.info(f"Detected LLM-generated {years_ago}-year default for Comtrade, overriding with 10-year default")
-                    should_apply_default = True
-            except (ValueError, TypeError):
-                pass
-
-        if should_apply_default:
-            # Trade data: default to last 10 years
-            start_year_int = today.year - 10
-            end_year_int = today.year
-            routing["startDate"] = f"{start_year_int}-01-01"
-            routing["endDate"] = f"{end_year_int}-12-31"
-            routing["start_year"] = start_year_int  # Integer format for Comtrade API
-            routing["end_year"] = end_year_int      # Integer format for Comtrade API
-            logger.info(f"Applied default 10-year range for Comtrade: {start_year_int} to {end_year_int}")
-            return routing
-
-        # User specified a specific date range (not ~5 years), respect it
-        return routing
-
-    # For non-Comtrade providers, check if dates are specified
-    if start_date or end_date:
-        # User specified a time range, respect their request
-        return routing
-
-    # Apply provider-specific defaults for other providers
-    if provider_upper == "COINGECKO":
-        # Crypto: default to last 30 days for historical chart
-        start = today - timedelta(days=30)
-        routing["startDate"] = start.strftime("%Y-%m-%d")
-        routing["endDate"] = today.strftime("%Y-%m-%d")
-        logger.info(f"Applied default 30-day range for CoinGecko: {routing['startDate']} to {routing['endDate']}")
-
-    # ExchangeRate: DO NOT apply default date range
-    # The ExchangeRate-API free tier only supports CURRENT rates
-    # If user wants historical exchange rates, they should explicitly ask for dates
-    # Without dates, ExchangeRate-API returns current rates directly
-    # Historical queries will automatically fallback to FRED when dates are specified
-    if provider_upper == "EXCHANGERATE":
-        # Don't apply default - let ExchangeRate-API return current rates
-        # This ensures "What is USD to EUR exchange rate?" uses ExchangeRate-API
-        logger.info(f"ExchangeRate: No default date range applied (current rates only)")
-
-    # For other providers (FRED, World Bank, IMF, OECD, Eurostat, BIS, StatsCan):
-    # No default - return all available data
-
-    return routing
-
 
 def filter_data_by_date_range(
     data: List[NormalizedData],

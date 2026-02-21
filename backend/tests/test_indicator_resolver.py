@@ -202,6 +202,61 @@ class IndicatorResolverTests(unittest.TestCase):
         self.assertEqual(result.code, "NE.IMP.GNFS.ZS")
         self.assertEqual(result.source, "catalog")
 
+    def test_prefers_export_series_over_generic_gdp_ratio_matches(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "NY.GDP.MKTP.ZG",
+                    "provider": "WorldBank",
+                    "name": "Gross domestic product (Av. annual growth, %)",
+                },
+                {
+                    "code": "NY.GDS.TOTL.ZS",
+                    "provider": "WorldBank",
+                    "name": "Gross domestic savings (% of GDP)",
+                },
+                {
+                    "code": "NE.TRD.GNFS.ZS",
+                    "provider": "WorldBank",
+                    "name": "Trade (% of GDP)",
+                },
+                {
+                    "code": "NE.EXP.GNFS.ZS",
+                    "provider": "WorldBank",
+                    "name": "Exports of goods and services (% of GDP)",
+                },
+            ]
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("export to gdp ratio", provider="WorldBank", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "NE.EXP.GNFS.ZS")
+        self.assertGreaterEqual(result.confidence, 0.7)
+
+    def test_handles_common_ratio_typo_without_misrouting(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "NY.GDS.TOTL.ZS",
+                    "provider": "WorldBank",
+                    "name": "Gross domestic savings (% of GDP)",
+                },
+                {
+                    "code": "NE.EXP.GNFS.ZS",
+                    "provider": "WorldBank",
+                    "name": "Exports of goods and services (% of GDP)",
+                },
+            ]
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("export to gdp ration", provider="WorldBank", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "NE.EXP.GNFS.ZS")
+
 
 if __name__ == "__main__":
     unittest.main()

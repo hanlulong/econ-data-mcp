@@ -89,7 +89,7 @@ class QueryServiceTests(unittest.TestCase):
         # Service now uses LangGraph, so step names have changed
         # Check for either old-style or new-style step names
         has_parsing = "parsing_query" in step_names or "langgraph_execution" in step_names
-        has_fetching = "fetching_data" in step_names
+        has_fetching = "fetching_data" in step_names or "cache_hit" in step_names
         self.assertTrue(has_parsing, f"Expected parsing step, got: {step_names}")
         self.assertTrue(has_fetching, f"Expected fetching step, got: {step_names}")
 

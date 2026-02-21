@@ -42,6 +42,34 @@ class IndicatorLookup:
 
     def __init__(self, db: Optional[IndicatorDatabase] = None):
         self.db = db or get_indicator_database()
+        # Canonical provider names as stored in indicators.db
+        self._provider_aliases = {
+            "FRED": "FRED",
+            "WORLDBANK": "WorldBank",
+            "WORLD BANK": "WorldBank",
+            "IMF": "IMF",
+            "EUROSTAT": "Eurostat",
+            "OECD": "OECD",
+            "STATSCAN": "StatsCan",
+            "STATISTICSCANADA": "StatsCan",
+            "STATISTICS CANADA": "StatsCan",
+            "BIS": "BIS",
+            "COMTRADE": "Comtrade",
+            "COINGECKO": "CoinGecko",
+            "COIN GECKO": "CoinGecko",
+            "EXCHANGERATE": "ExchangeRate",
+            "EXCHANGE RATE": "ExchangeRate",
+            "EXCHANGE-RATE": "ExchangeRate",
+        }
+
+    def _normalize_provider(self, provider: Optional[str]) -> Optional[str]:
+        """Normalize provider aliases to canonical database provider names."""
+        if not provider:
+            return None
+        compact = provider.strip().replace("_", " ").replace("-", " ").upper()
+        compact = " ".join(compact.split())
+        no_space = compact.replace(" ", "")
+        return self._provider_aliases.get(compact) or self._provider_aliases.get(no_space) or provider
 
     def search(
         self,
@@ -68,6 +96,8 @@ class IndicatorLookup:
         if not query:
             return []
 
+        provider = self._normalize_provider(provider)
+
         # Use database FTS search
         results = self.db.search(query, provider, category, limit)
 
@@ -87,7 +117,8 @@ class IndicatorLookup:
         Returns:
             Indicator metadata or None if not found
         """
-        return self.db.get_by_code(provider, code)
+        normalized_provider = self._normalize_provider(provider) or provider
+        return self.db.get_by_code(normalized_provider, code)
 
     def find_best_provider(
         self,

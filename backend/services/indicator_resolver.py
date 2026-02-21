@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .indicator_lookup import IndicatorLookup, get_indicator_lookup
 from .indicator_translator import IndicatorTranslator, get_indicator_translator
+from ..routing.country_resolver import CountryResolver
 from .catalog_service import (
     find_concept_by_term,
     get_indicator_code,
@@ -92,6 +93,38 @@ class IndicatorResolver:
             "index", "value", "values", "percent", "percentage",
             "country", "countries", "from", "with", "by", "on", "at",
         }
+        # Context terms often appear in many indicators and are weak discriminators.
+        self._context_terms: Set[str] = {
+            "gdp", "ratio", "share", "rate", "index", "value", "values",
+            "annual", "quarterly", "monthly", "yearly", "current", "constant",
+            "real", "nominal", "level", "levels", "total", "overall", "change",
+            "growth", "percent", "percentage",
+        }
+        self._directional_terms: Set[str] = {
+            "export", "import", "saving", "debt", "inflation", "unemployment",
+            "investment", "consumption", "productivity", "employment",
+        }
+        self._term_corrections: Dict[str, str] = {
+            "ration": "ratio",
+            "exprot": "export",
+            "improt": "import",
+            "savngs": "savings",
+        }
+        # Remove country/location tokens from lexical matching so "in China and UK"
+        # does not dilute indicator intent scoring.
+        self._geo_terms: Set[str] = set()
+        for alias in CountryResolver.COUNTRY_ALIASES.keys():
+            term = str(alias).strip().lower()
+            if not term or " " in term:
+                continue
+            if len(term) >= 3 or term in {"us", "uk", "eu", "uae"}:
+                self._geo_terms.add(term)
+        for iso_code in CountryResolver.COUNTRY_ALIASES.values():
+            term = str(iso_code).strip().lower()
+            if not term:
+                continue
+            if len(term) >= 3 or term in {"us", "gb", "eu"}:
+                self._geo_terms.add(term)
 
     def resolve(
         self,
@@ -176,7 +209,7 @@ class IndicatorResolver:
 
         # 4. Try FTS5 search in database (fallback for terms not in translator/catalog)
         if not result:
-            search_results = self.lookup.search(query, provider=provider, limit=5)
+            search_results = self.lookup.search(query, provider=provider, limit=10)
             if search_results:
                 best, best_confidence = self._pick_best_search_result(
                     query,
@@ -403,7 +436,10 @@ class IndicatorResolver:
         raw_terms = set(re.findall(r"[a-z0-9]+", text.lower()))
         terms: Set[str] = set()
         for term in raw_terms:
+            term = self._term_corrections.get(term, term)
             if len(term) <= 1 or term in self._stop_words:
+                continue
+            if term in self._geo_terms:
                 continue
             terms.add(term)
             # Lightweight stemming for plural variants (imports/import, prices/price).
@@ -437,12 +473,21 @@ class IndicatorResolver:
 
         query_terms = self._tokenize_terms(query_text)
         candidate_terms = self._tokenize_terms(f"{name} {code} {description}")
+        name_terms = self._tokenize_terms(f"{name} {code}")
 
         if not query_terms:
             return 0.0
 
         overlap_count = len(query_terms & candidate_terms)
         overlap_ratio = overlap_count / max(len(query_terms), 1)
+
+        # Emphasize non-generic query terms (e.g., export/import/debt) to avoid
+        # generic GDP-ratio candidates outranking the actual target concept.
+        core_query_terms = {term for term in query_terms if term not in self._context_terms}
+        core_overlap_count = len(core_query_terms & candidate_terms)
+        core_overlap_ratio = core_overlap_count / max(len(core_query_terms), 1)
+        core_name_overlap_count = len(core_query_terms & name_terms)
+        core_name_overlap_ratio = core_name_overlap_count / max(len(core_query_terms), 1)
 
         phrase_bonus = 0.0
         name_lower = name.lower()
@@ -454,11 +499,28 @@ class IndicatorResolver:
         # Slightly favor higher-ranked FTS results while keeping lexical fit primary.
         rank_bonus = max(0.0, 0.1 - (rank_index * 0.02))
 
-        confidence = 0.1 + (0.75 * overlap_ratio) + phrase_bonus + rank_bonus
+        confidence = (
+            0.05
+            + (0.60 * overlap_ratio)
+            + phrase_bonus
+            + rank_bonus
+            + (0.25 * core_overlap_ratio)
+            + (0.15 * core_name_overlap_ratio)
+        )
 
         # Strongly penalize candidates with zero lexical overlap.
         if overlap_count == 0 and (query_text not in name_lower) and (query_text not in code.lower()):
             confidence *= 0.2
+        # Penalize candidates that miss all core terms in the query.
+        if core_query_terms and core_overlap_count == 0:
+            confidence -= 0.25
+        # Prefer candidates where directional intent terms (export/import/etc.) appear in name/code.
+        directional_core = core_query_terms & self._directional_terms
+        if directional_core and not (directional_core & name_terms):
+            confidence -= 0.12
+        # Mild penalty when core terms only appear in long descriptions.
+        if core_query_terms and core_overlap_count > 0 and core_name_overlap_count == 0:
+            confidence -= 0.06
 
         return max(0.0, min(1.0, confidence))
 

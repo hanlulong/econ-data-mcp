@@ -34,6 +34,7 @@ from ..providers.coingecko import CoinGeckoProvider
 from ..utils.geographies import normalize_canadian_region_list
 from ..utils.retry import retry_async, DataNotAvailableError
 from ..services.rate_limiter import is_provider_circuit_open
+from ..services.time_range_defaults import apply_default_time_range
 from ..utils.processing_steps import (
     ProcessingTracker,
     activate_processing_tracker,
@@ -1354,7 +1355,6 @@ class QueryService:
         return all_data
 
     async def _fetch_data(self, intent: ParsedIntent) -> List[NormalizedData]:
-        from backend.services.langchain_orchestrator import apply_default_time_range
         logger.info(f"🔍 _fetch_data called: provider={intent.apiProvider}, indicators={intent.indicators}")
 
         provider = normalize_provider_name(intent.apiProvider)
