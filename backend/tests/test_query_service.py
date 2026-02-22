@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from backend.models import NormalizedData, ParsedIntent
+from backend.models import GeneratedFile, NormalizedData, ParsedIntent
 from backend.routing.unified_router import RoutingDecision
 from backend.services.cache import cache_service
 from backend.services.query import QueryService
@@ -211,6 +211,32 @@ class QueryServiceTests(unittest.TestCase):
 
         self.assertEqual(fetch_mock.call_args.kwargs.get("indicator"), "BIS.CBPOL")
 
+    def test_fetch_data_replaces_explicit_fred_code_when_query_conflicts(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="FRED",
+            indicators=["interest rate"],
+            parameters={"country": "US", "indicator": "FEDFUNDS"},
+            clarificationNeeded=False,
+            originalQuery="US 10-year government bond yield from 2000 to 2024",
+        )
+
+        class _Resolved:
+            code = "DGS10"
+            confidence = 0.95
+            source = "catalog"
+
+        class _Resolver:
+            def resolve(self, query, provider=None, **kwargs):
+                return _Resolved()
+
+        with patch("backend.services.query.get_indicator_resolver", return_value=_Resolver()), \
+             patch.object(self.service, "_get_from_cache", return_value=None), \
+             patch.object(self.service.fred_provider, "fetch_series", return_value=sample_series()) as fetch_mock:
+            run(self.service._fetch_data(intent))  # pylint: disable=protected-access
+
+        params = fetch_mock.call_args.args[0]
+        self.assertEqual(params.get("indicator"), "DGS10")
+
     def test_is_resolved_indicator_plausible_rejects_bis_debt_service_for_debt_gdp_query(self) -> None:
         self.assertFalse(
             self.service._is_resolved_indicator_plausible(  # pylint: disable=protected-access
@@ -220,11 +246,115 @@ class QueryServiceTests(unittest.TestCase):
             )
         )
 
+    def test_is_resolved_indicator_plausible_rejects_bis_debt_securities_for_debt_gdp_query(self) -> None:
+        self.assertFalse(
+            self.service._is_resolved_indicator_plausible(  # pylint: disable=protected-access
+                provider="BIS",
+                indicator_query="gdp to debt ratio in china",
+                resolved_code="WS_DEBT_SEC2_PUB",
+            )
+        )
+
+    def test_is_resolved_indicator_plausible_rejects_fred_policy_rate_for_bond_yield_query(self) -> None:
+        self.assertFalse(
+            self.service._is_resolved_indicator_plausible(  # pylint: disable=protected-access
+                provider="FRED",
+                indicator_query="US 10-year government bond yield from 2000 to 2024",
+                resolved_code="FEDFUNDS",
+            )
+        )
+
+        self.assertTrue(
+            self.service._is_resolved_indicator_plausible(  # pylint: disable=protected-access
+                provider="FRED",
+                indicator_query="US 10-year government bond yield from 2000 to 2024",
+                resolved_code="DGS10",
+            )
+        )
+
         self.assertTrue(
             self.service._is_resolved_indicator_plausible(  # pylint: disable=protected-access
                 provider="BIS",
                 indicator_query="debt service ratio in china",
                 resolved_code="WS_DSR",
+            )
+        )
+
+    def test_select_indicator_query_uses_original_for_discontinued_indicator(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="FRED",
+            indicators=["Composite Yield on U.S. Treasury Bonds with Maturity over 10 Years (DISCONTINUED)"],
+            parameters={"country": "US"},
+            clarificationNeeded=False,
+            originalQuery="US 10-year government bond yield from 2000 to 2024",
+        )
+
+        selected = self.service._select_indicator_query_for_resolution(intent)  # pylint: disable=protected-access
+        self.assertEqual(selected, "US 10-year government bond yield from 2000 to 2024")
+
+    def test_apply_concept_provider_override_reroutes_unavailable_provider(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="BIS",
+            indicators=["WS_DSR"],
+            parameters={"country": "CN"},
+            clarificationNeeded=False,
+            originalQuery="gdp to debt ratio in china",
+        )
+
+        with patch("backend.services.catalog_service.find_concept_by_term", return_value="government_debt"), \
+             patch("backend.services.catalog_service.is_provider_available", return_value=False), \
+             patch("backend.services.catalog_service.get_best_provider", return_value=("IMF", "GGXWDG_NGDP", 0.95)):
+            provider, params = self.service._apply_concept_provider_override(  # pylint: disable=protected-access
+                "BIS",
+                intent,
+                dict(intent.parameters),
+            )
+
+        self.assertEqual(provider, "IMF")
+        self.assertEqual(intent.apiProvider, "IMF")
+        self.assertEqual(params.get("indicator"), "GGXWDG_NGDP")
+
+    def test_normalize_bis_metadata_labels_replaces_opaque_code(self) -> None:
+        bis_series = NormalizedData.model_validate(
+            {
+                "metadata": {
+                    "source": "BIS",
+                    "indicator": "WS_DSR",
+                    "country": "CN",
+                    "frequency": "quarterly",
+                    "unit": "percent",
+                    "lastUpdated": "",
+                    "seriesId": "WS_DSR",
+                },
+                "data": [{"date": "2020-01-01", "value": 1.0}],
+            }
+        )
+
+        self.service._normalize_bis_metadata_labels([bis_series])  # pylint: disable=protected-access
+
+        self.assertNotEqual(bis_series.metadata.indicator, "WS_DSR")
+        self.assertIn("debt service", bis_series.metadata.indicator.lower())
+
+    def test_has_implausible_top_series_detects_wrong_fred_tenor(self) -> None:
+        wrong_series = NormalizedData.model_validate(
+            {
+                "metadata": {
+                    "source": "FRED",
+                    "indicator": "Composite Yield on U.S. Treasury Bonds with Maturity over 10 Years (DISCONTINUED)",
+                    "country": "US",
+                    "frequency": "daily",
+                    "unit": "Percent",
+                    "lastUpdated": "",
+                    "seriesId": "DLTBOARD",
+                },
+                "data": [{"date": "2020-01-01", "value": 1.0}],
+            }
+        )
+
+        self.assertTrue(
+            self.service._has_implausible_top_series(  # pylint: disable=protected-access
+                "US 10-year government bond yield from 2000 to 2024",
+                [wrong_series],
             )
         )
 
@@ -581,6 +711,65 @@ class QueryServiceTests(unittest.TestCase):
         first_call = resolver.calls[0]
         self.assertEqual(first_call.get("country"), "CN")
         self.assertEqual(first_call.get("countries"), ["CN", "GB"])
+
+    def test_execute_with_langgraph_handles_generated_file_models(self) -> None:
+        class _FakeGraph:
+            async def ainvoke(self, _initial_state, _config):
+                return {
+                    "is_pro_mode": True,
+                    "code_execution": {
+                        "code": "print('ok')",
+                        "output": "ok",
+                        "error": None,
+                        "files": [
+                            GeneratedFile(
+                                url="/static/promode/report.png",
+                                name="report.png",
+                                type="image",
+                            )
+                        ],
+                    },
+                }
+
+        class _FakeStateManager:
+            def get(self, _conversation_id):
+                return None
+
+            def update(self, *_args, **_kwargs):
+                return None
+
+        with patch("backend.agents.get_agent_graph", return_value=_FakeGraph()), \
+             patch("backend.agents.set_query_service_provider"), \
+             patch("backend.memory.state_manager.get_state_manager", return_value=_FakeStateManager()):
+            response = run(
+                self.service._execute_with_langgraph(  # pylint: disable=protected-access
+                    query="create inflation forecast chart",
+                    conversation_id="conv-lg-pro",
+                    conversation_history=[],
+                    tracker=None,
+                )
+            )
+
+        self.assertTrue(response.isProMode)
+        self.assertIsNotNone(response.codeExecution)
+        assert response.codeExecution is not None
+        self.assertEqual(response.codeExecution.files[0].name, "report.png")
+
+    def test_fetch_data_coingecko_normalizes_empty_coin_ids_and_vs_currency(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="CoinGecko",
+            indicators=["bitcoin market cap"],
+            parameters={"coinIds": None, "vsCurrency": "right"},
+            clarificationNeeded=False,
+            originalQuery="bitcoin market cap right now",
+        )
+
+        with patch.object(self.service, "_get_from_cache", return_value=None), \
+             patch.object(self.service.coingecko_provider, "get_historical_data_range", return_value=[sample_series()]) as range_mock:
+            run(self.service._fetch_data(intent))  # pylint: disable=protected-access
+
+        self.assertTrue(range_mock.called)
+        self.assertEqual(range_mock.call_args.kwargs.get("vs_currency"), "usd")
 
 
 if __name__ == "__main__":

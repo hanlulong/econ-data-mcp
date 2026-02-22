@@ -173,6 +173,16 @@ class IndicatorResolverTests(unittest.TestCase):
         self.assertEqual(result.code, "SL.TLF.CACT.ZS")
         self.assertEqual(result.source, "catalog")
 
+    def test_resolves_employment_to_population_ratio_via_catalog(self):
+        lookup = _FakeLookup(search_results=[])
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("employment to population ratio", provider="WorldBank", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "SL.EMP.TOTL.SP.ZS")
+        self.assertEqual(result.source, "catalog")
+
     def test_resolves_foreign_exchange_reserves_via_catalog(self):
         lookup = _FakeLookup(search_results=[])
         resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
@@ -222,6 +232,74 @@ class IndicatorResolverTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.code, "WS_DSR")
         self.assertIn(result.source, {"catalog", "translator"})
+
+    def test_money_aggregate_scoring_prefers_requested_aggregate(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "M2REAL",
+                    "provider": "FRED",
+                    "name": "Real M2 Money Stock",
+                    "description": "Real M2 money stock",
+                },
+                {
+                    "code": "M1SL",
+                    "provider": "FRED",
+                    "name": "M1 Money Stock",
+                    "description": "M1 money stock",
+                },
+            ]
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("US M1 money stock trend", provider="FRED", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "M1SL")
+
+    def test_concept_lookup_handles_underscored_bond_yield_query(self):
+        lookup = _FakeLookup(search_results=[])
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("10_YEAR_TREASURY_YIELD", provider="FRED", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "DGS10")
+        self.assertEqual(result.source, "catalog")
+
+    def test_catalog_preferred_over_translator_for_bond_yield_concept(self):
+        lookup = _FakeLookup(search_results=[])
+        resolver = IndicatorResolver(lookup=lookup, translator=IndicatorTranslator())
+
+        result = resolver.resolve("10-year government bond yield", provider="FRED", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "DGS10")
+        self.assertEqual(result.source, "catalog")
+
+    def test_discontinued_series_penalty_prefers_active_alternative(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "DLTBOARD",
+                    "provider": "FRED",
+                    "name": "Composite Yield on U.S. Treasury Bonds with Maturity over 10 Years (DISCONTINUED)",
+                    "description": "Discontinued series",
+                },
+                {
+                    "code": "DGS10",
+                    "provider": "FRED",
+                    "name": "Market Yield on U.S. Treasury Securities at 10-Year Constant Maturity",
+                    "description": "Daily Treasury constant maturity yield",
+                },
+            ]
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("US 10-year government bond yield", provider="FRED", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "DGS10")
 
     def test_resolves_industrial_production_via_catalog(self):
         lookup = _FakeLookup(search_results=[])

@@ -157,7 +157,17 @@ class UnifiedRouter:
 
         # Priority 3: Special case handlers (before keyword matching)
 
-        # 3a: Exchange rate queries → ExchangeRate
+        # 3a: Crypto and token market data → CoinGecko
+        if self._is_crypto_query(query_lower, indicators):
+            return self._create_decision(
+                provider="CoinGecko",
+                confidence=0.92,
+                match_type="indicator",
+                matched_pattern="crypto asset query",
+                reasoning="Cryptocurrency/token market query routed to CoinGecko",
+            )
+
+        # 3b: Exchange rate queries → ExchangeRate
         if self._is_exchange_rate_query(query_lower, indicators):
             # Exception: Real/Nominal effective exchange rate (REER/NEER) → IMF or BIS
             if "real effective exchange rate" in query_lower or "reer" in query_lower:
@@ -184,7 +194,7 @@ class UnifiedRouter:
                 reasoning="Exchange rate query routed to ExchangeRate-API",
             )
 
-        # 3b: Trade as % of GDP → WorldBank (NOT Comtrade)
+        # 3c: Trade as % of GDP → WorldBank (NOT Comtrade)
         if self._is_trade_ratio_query(query_lower, indicators):
             return self._create_decision(
                 provider="WorldBank",
@@ -194,7 +204,7 @@ class UnifiedRouter:
                 reasoning="Trade as percentage of GDP is a development indicator from WorldBank",
             )
 
-        # 3b2: Debt-to-GDP style macro debt ratios → IMF.
+        # 3c2: Debt-to-GDP style macro debt ratios → IMF.
         # Avoid routing these to BIS debt-service datasets.
         if self._is_macro_debt_ratio_query(query_lower, indicators):
             return self._create_decision(
@@ -205,7 +215,7 @@ class UnifiedRouter:
                 reasoning="Macro debt-to-GDP ratio queries are best served by IMF fiscal datasets",
             )
 
-        # 3c: US trade balance (without partner) → FRED
+        # 3d: US trade balance (without partner) → FRED
         if self._is_us_trade_balance_no_partner(query, country):
             return self._create_decision(
                 provider="FRED",
@@ -215,7 +225,7 @@ class UnifiedRouter:
                 reasoning="US trade balance (without partner) uses FRED BOPGSTB series",
             )
 
-        # 3c2: US housing construction indicators (housing starts/building permits) → FRED
+        # 3d2: US housing construction indicators (housing starts/building permits) → FRED
         if self._is_us_housing_construction_query(query, query_lower, indicators, country):
             return self._create_decision(
                 provider="FRED",
@@ -225,7 +235,51 @@ class UnifiedRouter:
                 reasoning="US housing starts/building permits are FRED series",
             )
 
-        # 3d: IMF for forecast/projection and global macro aggregates.
+        # 3d3: Money supply / money stock queries.
+        if self._is_money_supply_query(query_lower, indicators):
+            if self._is_us_context(country, query_lower):
+                return self._create_decision(
+                    provider="FRED",
+                    confidence=0.90,
+                    match_type="indicator",
+                    matched_pattern="US money supply",
+                    reasoning="US money supply/stock series are best sourced from FRED",
+                )
+            return self._create_decision(
+                provider="WorldBank",
+                confidence=0.84,
+                match_type="indicator",
+                matched_pattern="money supply",
+                reasoning="Cross-country money supply queries are best covered by WorldBank",
+            )
+
+        # 3d4: Bond-yield / sovereign-rate queries.
+        if self._is_bond_yield_query(query_lower, indicators):
+            if self._is_us_context(country, query_lower):
+                return self._create_decision(
+                    provider="FRED",
+                    confidence=0.90,
+                    match_type="indicator",
+                    matched_pattern="US bond yield",
+                    reasoning="US Treasury yield queries are best sourced from FRED",
+                )
+            if "oecd" in query_lower:
+                return self._create_decision(
+                    provider="OECD",
+                    confidence=0.82,
+                    match_type="indicator",
+                    matched_pattern="oecd bond yield",
+                    reasoning="OECD long-term interest rate comparisons route to OECD",
+                )
+            return self._create_decision(
+                provider="IMF",
+                confidence=0.78,
+                match_type="indicator",
+                matched_pattern="bond yield",
+                reasoning="Cross-country sovereign yield queries default to IMF",
+            )
+
+        # 3e: IMF for forecast/projection and global macro aggregates.
         if self._is_forecast_or_projection_query(query_lower):
             return self._create_decision(
                 provider="IMF",
@@ -244,7 +298,7 @@ class UnifiedRouter:
                 reasoning="Global/aggregate macro query routed to IMF",
             )
 
-        # 3e: Multi-country ratio comparisons are best covered by WorldBank.
+        # 3f: Multi-country ratio comparisons are best covered by WorldBank.
         if self._is_worldbank_cross_country_ratio_query(query_lower):
             return self._create_decision(
                 provider="WorldBank",
@@ -263,11 +317,11 @@ class UnifiedRouter:
                 reasoning="Country-group current account history routed to WorldBank",
             )
 
-        # 3f: Canadian query handling
+        # 3g: Canadian query handling
         if CountryResolver.is_canadian_region(query):
             return self._handle_canadian_query(query, indicators, country)
 
-        # 3g: Property/house prices → BIS
+        # 3h: Property/house prices → BIS
         if self._is_property_price_query(query_lower, indicators):
             return self._create_decision(
                 provider="BIS",
@@ -277,7 +331,7 @@ class UnifiedRouter:
                 reasoning="Property/house prices best sourced from BIS",
             )
 
-        # 3h: Merchandise trade flow queries default to Comtrade.
+        # 3i: Merchandise trade flow queries default to Comtrade.
         if self._is_merchandise_trade_flow_query(query_lower):
             return self._create_decision(
                 provider="Comtrade",
@@ -287,7 +341,7 @@ class UnifiedRouter:
                 reasoning="Import/export goods flow query routed to Comtrade",
             )
 
-        # 3i: Prefer Eurostat for standard historical EU-country macro indicators.
+        # 3j: Prefer Eurostat for standard historical EU-country macro indicators.
         if country and CountryResolver.is_eu_member(country):
             if self._is_eurostat_country_indicator_query(query_lower):
                 return self._create_decision(
@@ -421,6 +475,30 @@ class UnifiedRouter:
             matched_pattern=matched_pattern,
         )
 
+    def _is_crypto_query(self, query_lower: str, indicators: List[str]) -> bool:
+        """Check if query is clearly about cryptocurrencies/tokens."""
+        indicators_str = " ".join(indicators).lower()
+        combined = f"{query_lower} {indicators_str}"
+
+        strong_token_terms = [
+            "bitcoin", "btc", "ethereum", "eth", "crypto", "cryptocurrency",
+            "xrp", "ripple", "solana", "cardano", "dogecoin", "litecoin",
+            "altcoin", "defi", "nft", "token", "stablecoin", "bnb",
+        ]
+        strong_phrase_terms = ["binance coin"]
+
+        if any(
+            re.search(rf"\b{re.escape(term)}\b", combined)
+            for term in strong_token_terms
+        ):
+            return True
+        if any(phrase in combined for phrase in strong_phrase_terms):
+            return True
+
+        has_market_word = any(term in combined for term in ["market cap", "market capitalization", "trading volume", "coin ranking"])
+        has_coin_context = any(term in combined for term in ["coin", "token", "cryptocurrency", "crypto"])
+        return bool(has_market_word and has_coin_context)
+
     def _is_exchange_rate_query(self, query_lower: str, indicators: List[str]) -> bool:
         """Check if query is about exchange rates."""
         indicators_str = " ".join(indicators).lower()
@@ -528,6 +606,48 @@ class UnifiedRouter:
             "building permit",
             "residential construction",
             "housing construction",
+        ])
+
+    @staticmethod
+    def _is_us_context(country: Optional[str], query_lower: str) -> bool:
+        """Detect US query context from structured country or query text."""
+        return (
+            (country and country.upper() in ["US", "USA", "UNITED STATES"])
+            or any(term in query_lower for term in ["us ", "u.s.", "united states", "america"])
+        )
+
+    def _is_money_supply_query(self, query_lower: str, indicators: List[str]) -> bool:
+        """Detect money supply and monetary aggregate queries."""
+        indicators_str = " ".join(indicators).lower()
+        combined = f"{query_lower} {indicators_str}"
+        return any(term in combined for term in [
+            "money supply",
+            "money stock",
+            "broad money",
+            "narrow money",
+            "m1",
+            "m2",
+            "m3",
+            "monetary aggregate",
+        ])
+
+    def _is_bond_yield_query(self, query_lower: str, indicators: List[str]) -> bool:
+        """Detect sovereign/government bond yield and long-term interest queries."""
+        indicators_str = " ".join(indicators).lower()
+        combined = f"{query_lower} {indicators_str}"
+        return any(term in combined for term in [
+            "bond yield",
+            "government bond yield",
+            "treasury yield",
+            "10-year yield",
+            "10 year yield",
+            "2-year yield",
+            "2 year yield",
+            "yield spread",
+            "yield curve",
+            "long-term interest rate",
+            "long term interest rate",
+            "sovereign yield",
         ])
 
     def _is_property_price_query(self, query_lower: str, indicators: List[str]) -> bool:

@@ -1,26 +1,27 @@
 # Framework Sweep 100 TODO
 
-- Last Run (UTC): `2026-02-21T23:09:37.049735+00:00`
+- Last Run (UTC): `2026-02-22T01:56:34.416792+00:00`
 - Target: `http://localhost:3001`
-- Raw Report: `docs/testing/reports/framework_sweep_100_20260221_230937.json`
+- Raw Report: `docs/testing/reports/framework_sweep_100_20260222_015634.json`
 
 ## Summary
 
 - Total: **100**
-- Pass: **85**
-- Warn: **11**
-- Fail: **1**
-- Error: **3**
+- Pass: **77**
+- Warn: **9**
+- Fail: **9**
+- Error: **5**
 - Timeout: **0**
-- Strict Pass Rate: **85.0%**
-- Effective Pass Rate (pass+warn): **96.0%**
-- Average Response Time: **7137 ms**
+- Strict Pass Rate: **77.0%**
+- Effective Pass Rate (pass+warn): **86.0%**
+- Average Response Time: **8968 ms**
 
 ## Framework Issues To Fix
 
-- [ ] `provider_mismatch` (11)
-- [ ] `api_error` (3)
-- [ ] `no_data` (1)
+- [ ] `provider_mismatch` (9)
+- [ ] `api_error` (5)
+- [ ] `clarification` (5)
+- [ ] `no_data` (4)
 
 ## Query Checklist
 
@@ -31,9 +32,9 @@
 - [x] Q003 GDP per capita trend in Brazil and Mexico over the past decade
   - `PASS` | `macro_growth` | `WORLDBANK` | `GDP per capita (current US$)`
 - [x] Q004 Nominal GDP in Japan and South Korea from 2010 to 2023
-  - `PASS` | `macro_growth` | `WORLDBANK` | `GDP (current US$)`
+  - `PASS` | `macro_growth` | `WORLDBANK` | `Gross PSD, General Gov., All maturities, All instruments, Domestic currency, Nominal Value`
 - [ ] Q005 GDP deflator inflation in Germany between 2012 and 2024
-  - `ERROR` | `macro_growth` | `api_error` | `Eurostat dataset for 'TEINA110' not found. Try a different description or provide the dataset code directly.`
+  - `ERROR` | `macro_growth` | `api_error` | `Eurostat dataset for 'TEC00118' not found. Try a different description or provide the dataset code directly.`
 - [x] Q006 Potential output gap proxy for the US using real GDP growth
   - `PASS` | `macro_growth` | `FRED` | `Real Potential Gross Domestic Product`
 - [x] Q007 Unemployment rate in Spain, Italy, and Greece from 2010 to 2024
@@ -45,27 +46,27 @@
 - [x] Q010 Labor force participation in Canada from 2014 to 2024
   - `WARN` | `labor` | `WORLDBANK` | `Labor force participation rate, total (% of total population ages 15+) (modeled ILO estima` | `provider_mismatch`
 - [x] Q011 Employment to population ratio in South Africa and Nigeria
-  - `PASS` | `labor` | `WORLDBANK` | `Population, total`
-- [ ] Q012 Average wages and earnings trend in the US since 2016
-  - `ERROR` | `labor` | `api_error` | `Client error '400 Bad Request' for url 'https://api.stlouisfed.org/fred/series?series_id=EARNINGS&api_key=3125f90e12cd50e15cc28576920d0ed2&f`
+  - `PASS` | `labor` | `WORLDBANK` | `Employment to population ratio, 15+, total (%) (modeled ILO estimate)`
+- [x] Q012 Average wages and earnings trend in the US since 2016
+  - `WARN` | `labor` | `EUROSTAT` | `Annual net earnings of a full-time single worker without children earning an average wage` | `provider_mismatch`
 - [x] Q013 CPI inflation in Turkey, Argentina, and Egypt from 2018 to 2024
   - `PASS` | `inflation` | `WORLDBANK` | `Inflation, consumer prices (annual %)`
-- [x] Q014 HICP inflation in euro area countries 2019 to 2024
-  - `PASS` | `inflation` | `EUROSTAT` | `HICP - annual data (average index and rate of change)`
+- [ ] Q014 HICP inflation in euro area countries 2019 to 2024
+  - `FAIL` | `inflation` | `EUROSTAT` | `clarification` | `clarification needed`
 - [x] Q015 US core CPI and headline CPI since 2015
-  - `PASS` | `inflation` | `FRED` | `Consumer Price Index for All Urban Consumers: All Items Less Food and Energy in U.S. City `
+  - `PASS` | `inflation` | `FRED` | `Consumer Price Index for All Urban Consumers: All Items in U.S. City Average`
 - [x] Q016 Producer price inflation trend in the US and Germany
   - `PASS` | `inflation` | `FRED` | `Producer Price Index by Commodity: All Commodities`
-- [x] Q017 Inflation forecast style series for advanced economies
-  - `PASS` | `inflation` | `IMF` | `INFLATION`
+- [ ] Q017 Inflation forecast style series for advanced economies
+  - `FAIL` | `inflation` | `no_data` | `empty data array`
 - [x] Q018 Government debt to GDP ratio for G7 countries from 2005 to 2023
   - `WARN` | `fiscal` | `WORLDBANK` | `Central government debt, total (% of GDP)` | `provider_mismatch`
-- [x] Q019 General government fiscal balance for euro area members since 2010
-  - `PASS` | `fiscal` | `IMF` | `Fiscal Balance`
+- [ ] Q019 General government fiscal balance for euro area members since 2010
+  - `ERROR` | `fiscal` | `api_error` | `IMF indicator 'GXCBG_G14_GG_FY_XDC' not found. Try refining your query or consult IMF DataMapper for available indicators.`
 - [x] Q020 Public debt trend in Japan, Italy, and the US from 2000 to 2023
-  - `PASS` | `fiscal` | `IMF` | `PUBLIC_DEBT`
-- [x] Q021 Government deficit as share of GDP in India and Brazil
-  - `PASS` | `fiscal` | `IMF` | `government_debt`
+  - `PASS` | `fiscal` | `IMF` | `public debt`
+- [ ] Q021 Government deficit as share of GDP in India and Brazil
+  - `ERROR` | `fiscal` | `api_error` | `IMF indicator 'government deficit as % of GDP' not found. Try refining your query or consult IMF DataMapper for available indicators.`
 - [x] Q022 Current account balance to GDP in Korea and Thailand since 2010
   - `PASS` | `external_sector` | `IMF` | `Current account balance, percent of GDP`
 - [x] Q023 Foreign exchange reserves for China, India, and Saudi Arabia
@@ -75,13 +76,13 @@
 - [x] Q025 Gross national savings share of GDP in ASEAN countries
   - `PASS` | `external_sector` | `WORLDBANK` | `Gross savings (% of GDP)`
 - [x] Q026 Private sector credit to GDP for Chile, Colombia, and Peru
-  - `WARN` | `credit` | `BIS` | `WS_TC` | `provider_mismatch`
+  - `WARN` | `credit` | `BIS` | `Total credit (Private non-financial sector; Percentage of GDP)` | `provider_mismatch`
 - [x] Q027 Bank lending growth in the United States since 2019
   - `PASS` | `credit` | `FRED` | `Bank Credit, All Commercial Banks`
 - [x] Q028 Residential property prices in Canada, Australia, and Sweden since 2015
-  - `PASS` | `housing` | `BIS` | `WS_SPP`
+  - `PASS` | `housing` | `BIS` | `Selected residential property prices (Nominal)`
 - [x] Q029 House price index in Germany and Netherlands from 2012 to 2024
-  - `PASS` | `housing` | `BIS` | `WS_LONG_CPI`
+  - `PASS` | `housing` | `BIS` | `Selected residential property prices (Nominal)`
 - [x] Q030 US housing starts and building permits trend since 2016
   - `PASS` | `housing` | `FRED` | `New Privately-Owned Housing Units Started: Total Units`
 - [x] Q031 Exports to GDP ratio in China and the UK since 2000
@@ -92,8 +93,8 @@
   - `PASS` | `trade_ratio` | `WORLDBANK` | `Imports of goods and services (% of GDP)`
 - [x] Q034 Exports as percentage of GDP in Germany, France, and Italy
   - `PASS` | `trade_ratio` | `WORLDBANK` | `Exports of goods and services (% of GDP)`
-- [x] Q035 Net trade balance as share of GDP in Japan and Korea
-  - `PASS` | `trade_ratio` | `WORLDBANK` | `Net trade in goods and services (BoP, current US$)`
+- [ ] Q035 Net trade balance as share of GDP in Japan and Korea
+  - `FAIL` | `trade_ratio` | `WORLDBANK` | `clarification` | `clarification needed`
 - [x] Q036 Merchandise exports as share of GDP in Vietnam and Bangladesh
   - `PASS` | `trade_ratio` | `WORLDBANK` | `Exports of goods and services (% of GDP)`
 - [x] Q037 Merchandise imports as share of GDP in Mexico and Brazil
@@ -103,7 +104,7 @@
 - [x] Q039 Service imports share of GDP in UAE and Qatar
   - `PASS` | `trade_ratio` | `WORLDBANK` | `Imports of goods and services (% of GDP)`
 - [ ] Q040 Trade openness ratio (exports plus imports to GDP) in small open economies
-  - `ERROR` | `trade_ratio` | `api_error` | `No data found for any of the requested countries for indicator NE.TRD.GNFS.ZS. The data may not be available for the specified countries or `
+  - `FAIL` | `trade_ratio` | `WORLDBANK` | `clarification` | `clarification needed`
 - [x] Q041 US exports to China from 2018 to 2024
   - `PASS` | `bilateral_trade` | `COMTRADE` | `Exports - Total Trade`
 - [x] Q042 US imports from China from 2018 to 2024
@@ -133,9 +134,9 @@
 - [x] Q054 Japan semiconductor equipment exports in 2020 to 2024
   - `PASS` | `commodity_trade` | `COMTRADE` | `Exports - 8542`
 - [x] Q055 India pharmaceutical exports trend since 2015
-  - `PASS` | `commodity_trade` | `COMTRADE` | `Exports - 30`
+  - `PASS` | `commodity_trade` | `COMTRADE` | `Exports - Total Trade`
 - [x] Q056 Germany automobile exports trend since 2014
-  - `PASS` | `commodity_trade` | `COMTRADE` | `Exports - 8703`
+  - `PASS` | `commodity_trade` | `COMTRADE` | `Exports - Total Trade`
 - [x] Q057 France aircraft exports to the world from 2012 to 2024
   - `PASS` | `commodity_trade` | `COMTRADE` | `Exports - 88`
 - [x] Q058 Indonesia coal exports yearly from 2010 to 2024
@@ -167,39 +168,39 @@
 - [x] Q071 Federal funds target rate history since 2005
   - `PASS` | `policy_rate` | `FRED` | `Federal Funds Effective Rate`
 - [x] Q072 ECB policy rate trend from 2010 to 2024
-  - `PASS` | `policy_rate` | `BIS` | `WS_CBPOL`
+  - `PASS` | `policy_rate` | `BIS` | `Central bank policy rates`
 - [x] Q073 Bank of England base rate over the last 20 years
-  - `PASS` | `policy_rate` | `BIS` | `WS_CBPOL`
+  - `PASS` | `policy_rate` | `BIS` | `Central bank policy rates`
 - [x] Q074 Bank of Japan policy rate since 1999
-  - `PASS` | `policy_rate` | `BIS` | `WS_CBPOL`
+  - `PASS` | `policy_rate` | `BIS` | `Central bank policy rates`
 - [x] Q075 US 10-year government bond yield from 2000 to 2024
-  - `PASS` | `bond_yield` | `FRED` | `Composite Yield on U.S. Treasury Bonds with Maturity over 10 Years (DISCONTINUED)`
+  - `PASS` | `bond_yield` | `FRED` | `Market Yield on U.S. Treasury Securities at 10-Year Constant Maturity, Quoted on an Invest`
 - [x] Q076 US 2-year and 10-year yield spread since 2010
-  - `PASS` | `bond_yield` | `FRED` | `Market Yield on U.S. Treasury Securities at 2-Year Constant Maturity, Quoted on an Investm`
-- [x] Q077 Long-term interest rate comparison for OECD economies
-  - `WARN` | `bond_yield` | `BIS` | `WS_CBPOL` | `provider_mismatch`
+  - `PASS` | `bond_yield` | `FRED` | `Market Yield on U.S. Treasury Securities at 10-Year Constant Maturity, Quoted on an Invest`
+- [ ] Q077 Long-term interest rate comparison for OECD economies
+  - `ERROR` | `bond_yield` | `api_error` | `OECD indicator 'IRLT' not found in metadata catalog. Try refining your query or use a known indicator like: GDP, GDP Growth, Unemployment Ra`
 - [x] Q078 US M2 money supply growth from 2005 to 2024
-  - `PASS` | `money_supply` | `FRED` | `M2`
-- [x] Q079 US M1 money stock trend since 2010
   - `PASS` | `money_supply` | `FRED` | `Real M2 Money Stock`
+- [x] Q079 US M1 money stock trend since 2010
+  - `PASS` | `money_supply` | `FRED` | `M1`
 - [x] Q080 Broad money growth in China and India over the last decade
-  - `WARN` | `money_supply` | `FRED` | `Real M2 Money Stock` | `provider_mismatch`
+  - `PASS` | `money_supply` | `WORLDBANK` | `Broad money (% of GDP)`
 - [x] Q081 USD to EUR exchange rate over the last 12 months
   - `WARN` | `fx` | `FRED` | `USD to EUR Exchange Rate` | `provider_mismatch`
 - [x] Q082 USD to JPY exchange rate from 2020 to 2024
   - `WARN` | `fx` | `FRED` | `USD to JPY Exchange Rate` | `provider_mismatch`
 - [x] Q083 GBP to USD historical exchange rate for the last 5 years
   - `WARN` | `fx` | `FRED` | `GBP to USD Exchange Rate` | `provider_mismatch`
-- [x] Q084 Real effective exchange rate for Japan and Korea since 2010
-  - `WARN` | `fx` | `WORLDBANK` | `Real Effective Exchange Rate,,,,` | `provider_mismatch`
+- [ ] Q084 Real effective exchange rate for Japan and Korea since 2010
+  - `ERROR` | `fx` | `api_error` | `IMF DataMapper API does not have 'real effective exchange rate' data for: JPN, KOR. Data is available for 65 countries including: AGO, BDI, `
 - [x] Q085 REER trend for China and India from 2012 to 2024
-  - `WARN` | `fx` | `BIS` | `WS_XRU` | `provider_mismatch`
+  - `WARN` | `fx` | `BIS` | `US dollar exchange rates` | `provider_mismatch`
 - [x] Q086 Bitcoin price in USD for the last 365 days
   - `PASS` | `crypto` | `COINGECKO` | `Bitcoin Price`
 - [x] Q087 Ethereum market capitalization trend over the last year
   - `PASS` | `crypto` | `COINGECKO` | `Ethereum Market Cap`
 - [x] Q088 Top 10 cryptocurrencies by market cap right now
-  - `PASS` | `crypto` | `COINGECKO` | `Bitcoin Price`
+  - `PASS` | `crypto` | `COINGECKO` | `Bitcoin Market Cap`
 - [x] Q089 Solana trading volume over the last 90 days
   - `PASS` | `crypto` | `COINGECKO` | `Solana 24h Volume`
 - [x] Q090 XRP price performance over the last 6 months
@@ -210,17 +211,17 @@
   - `PASS` | `complex_comparison` | `WORLDBANK` | `Exports of goods and services (% of GDP)`
 - [ ] Q093 Which ASEAN country has the highest import share of GDP since 2015
   - `FAIL` | `complex_comparison` | `no_data` | `empty data array`
-- [x] Q094 Show debt to GDP ranking for euro area countries in the latest year
-  - `PASS` | `complex_comparison` | `IMF` | `Debt to GDP`
-- [x] Q095 Compare current account balances for energy importers versus exporters
-  - `PASS` | `complex_comparison` | `IMF` | `BCA_NGDPD`
+- [ ] Q094 Show debt to GDP ranking for euro area countries in the latest year
+  - `FAIL` | `complex_comparison` | `no_data` | `empty data array`
+- [ ] Q095 Compare current account balances for energy importers versus exporters
+  - `FAIL` | `complex_comparison` | `IMF` | `clarification` | `clarification needed`
 - [x] Q096 Contrast US and China trade balances before and after 2018
-  - `PASS` | `complex_comparison` | `WORLDBANK` | `Net trade in goods and services (BoP, current US$)`
-- [x] Q097 Compare house price growth across Canada, Australia, and the UK since 2015
-  - `PASS` | `complex_comparison` | `BIS` | `WS_SPP`
+  - `PASS` | `complex_comparison` | `FRED` | `Trade Balance: Goods and Services, Balance of Payments Basis`
+- [ ] Q097 Compare house price growth across Canada, Australia, and the UK since 2015
+  - `FAIL` | `complex_comparison` | `STATSCAN` | `clarification` | `clarification needed`
 - [x] Q098 Compare policy rates and inflation for US, UK, and euro area since 2010
   - `PASS` | `complex_comparison` | `WORLDBANK` | `Inflation, consumer prices (annual %)`
 - [x] Q099 How did import share of GDP evolve in India versus Vietnam after 2010
   - `PASS` | `complex_comparison` | `WORLDBANK` | `Imports of goods and services (% of GDP)`
-- [x] Q100 Rank top 10 economies by GDP growth in 2023
-  - `PASS` | `complex_comparison` | `WORLDBANK` | `GDP growth (annual %)`
+- [ ] Q100 Rank top 10 economies by GDP growth in 2023
+  - `FAIL` | `complex_comparison` | `no_data` | `empty data array`

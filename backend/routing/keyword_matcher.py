@@ -114,6 +114,9 @@ class KeywordMatcher:
             "united states gdp", "united states unemployment",
             "american gdp", "american unemployment", "american inflation",
             "federal funds", "fed rate", "treasury yield", "treasury rate",
+            "bond yield", "government bond yield", "10-year yield", "10 year yield",
+            "2-year yield", "2 year yield", "yield spread", "yield curve",
+            "m1 money supply", "m2 money supply", "money stock", "us money supply",
             "s&p 500", "s&p500", "dow jones", "nasdaq",
             "us trade balance", "u.s. trade balance", "us trade deficit",
             "u.s. trade deficit", "united states trade balance",
@@ -229,6 +232,7 @@ class KeywordMatcher:
             "agricultural land", "arable land",
             "mobile subscriptions", "internet users",
             "fertility rate", "birth rate", "death rate",
+            "broad money", "money supply growth", "monetary aggregate growth",
         ],
 
         # OECD-specific indicators (regional phrases moved to REGIONAL_KEYWORDS)
@@ -272,6 +276,8 @@ class KeywordMatcher:
             "cryptocurrency trading volume", "crypto trading volume",
             "nft", "blockchain", "altcoin", "crypto market cap",
             "bitcoin", "btc", "ethereum", "eth", "solana", "cardano", "dogecoin",
+            "xrp", "ripple", "litecoin", "ltc", "binance coin", "bnb",
+            "market cap", "trading volume",
         ],
     }
 
@@ -317,7 +323,8 @@ class KeywordMatcher:
         ],
         "crypto": [
             "bitcoin", "ethereum", "crypto", "blockchain", "defi", "nft",
-            "btc", "eth", "altcoin",
+            "btc", "eth", "altcoin", "xrp", "ripple", "solana", "dogecoin",
+            "market cap", "trading volume",
         ],
         "fiscal": [
             "government debt", "fiscal deficit", "budget", "government spending",
@@ -357,7 +364,8 @@ class KeywordMatcher:
     CRYPTO_KEYWORDS: Set[str] = {
         "bitcoin", "btc", "ethereum", "eth", "crypto", "cryptocurrency",
         "solana", "cardano", "dogecoin", "altcoin", "defi", "nft",
-        "blockchain", "stablecoin", "coin", "token"
+        "blockchain", "stablecoin", "coin", "token", "xrp", "ripple",
+        "litecoin", "ltc", "bnb"
     }
 
     # ==========================================================================

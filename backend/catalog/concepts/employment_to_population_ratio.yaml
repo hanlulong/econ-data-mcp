@@ -1,0 +1,46 @@
+# Employment to Population Ratio Indicator Catalog
+concept: employment_to_population_ratio
+category: labor
+domain: labor_market
+
+description: |
+  Employment-to-population ratio measures the share of a country's working-age
+  population that is employed.
+
+synonyms:
+  primary:
+    - employment to population ratio
+    - employment-population ratio
+    - employment to population rate
+    - employment ratio
+  secondary:
+    - employment share of population
+    - employed population ratio
+    - employment participation ratio
+
+explicit_exclusions:
+  - total population
+  - labor force participation
+  - unemployment rate
+
+providers:
+  WorldBank:
+    primary:
+      code: SL.EMP.TOTL.SP.ZS
+      name: "Employment to population ratio, 15+, total (%) (modeled ILO estimate)"
+      confidence: 0.95
+      coverage: global
+      frequency: annual
+
+  OECD:
+    primary:
+      code: EMP
+      name: "Employment rate"
+      confidence: 0.75
+      coverage: oecd_members
+      frequency: annual
+
+not_available:
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate

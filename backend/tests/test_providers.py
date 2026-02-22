@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from backend.models import NormalizedData
 from backend.providers.comtrade import ComtradeProvider
@@ -232,6 +232,30 @@ class ProviderTests(unittest.TestCase):
 
         self.assertEqual(balance.metadata.indicator, "Trade Balance with US")
         self.assertEqual(balance.data[0].value, 20)
+
+    def test_comtrade_splits_comma_separated_partner_input(self) -> None:
+        provider = ComtradeProvider(api_key="demo")
+        captured_partner_codes = []
+
+        async def _fake_fetch(
+            client, reporter_raw, partner_code, commodity_code, flow_code, period_param, freq_code
+        ):
+            captured_partner_codes.append(partner_code)
+            return []
+
+        with patch.object(provider, "_fetch_single_reporter_data", new=AsyncMock(side_effect=_fake_fetch)):
+            run(
+                provider.fetch_trade_data(
+                    reporter="UK",
+                    partner="Germany, Netherlands",
+                    flow="EXPORT",
+                    start_year=2021,
+                    end_year=2021,
+                )
+            )
+
+        self.assertIn("276", captured_partner_codes)  # Germany
+        self.assertIn("528", captured_partner_codes)  # Netherlands
 
     def test_worldbank_metadata_discovery(self) -> None:
         class StubMetadata:

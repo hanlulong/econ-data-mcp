@@ -1,0 +1,58 @@
+# Government Bond Yield Indicator Catalog
+concept: bond_yield
+category: monetary
+domain: financial_markets
+
+description: |
+  Government bond yields (especially 10-year) and long-term interest rates.
+
+synonyms:
+  primary:
+    - bond yield
+    - government bond yield
+    - sovereign yield
+    - treasury yield
+    - 10 year yield
+    - 10-year yield
+    - long-term interest rate
+    - long term interest rate
+  secondary:
+    - benchmark yield
+    - long bond yield
+    - yield curve long end
+
+explicit_exclusions:
+  - policy rate
+  - federal funds rate
+  - lending rate
+  - deposit rate
+
+providers:
+  FRED:
+    primary:
+      code: DGS10
+      name: "10-Year Treasury Constant Maturity Rate"
+      confidence: 0.95
+      coverage: [US]
+      frequency: daily
+
+  IMF:
+    primary:
+      code: rltir
+      name: "Real long term government bond yield, percent"
+      confidence: 0.85
+      coverage: global
+      frequency: annual
+
+  OECD:
+    primary:
+      code: IRLT
+      name: "Long-term interest rates"
+      confidence: 0.82
+      coverage: oecd_members
+      frequency: monthly
+
+not_available:
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate

@@ -95,9 +95,10 @@ class CoinGeckoProvider(BaseProvider):
         """
         # Use shared HTTP client pool for better performance
         client = get_http_client()
+        request_state = dict(params or {})
         for attempt in range(max_retries):
             # Build URL with current API key state (may change if key is invalid)
-            request_params = params.copy()
+            request_params = request_state.copy()
             url = self._build_url(endpoint, request_params)
             try:
                 response = await client.get(url, params=request_params, timeout=30.0)
@@ -130,6 +131,20 @@ class CoinGeckoProvider(BaseProvider):
                         continue
                     else:
                         raise DataNotAvailableError("CoinGecko rate limit exceeded. Please try again in a few minutes.")
+                elif status_code == 400:
+                    current_vs_currency = str(request_state.get("vs_currency") or "").lower()
+                    response_text = (e.response.text or "").lower()
+                    if (
+                        current_vs_currency
+                        and current_vs_currency != "usd"
+                        and ("vs_currency" in response_text or "invalid" in response_text)
+                    ):
+                        logger.warning(
+                            "⚠️ CoinGecko rejected vs_currency='%s'; retrying with 'usd'",
+                            current_vs_currency,
+                        )
+                        request_state["vs_currency"] = "usd"
+                        continue
                 elif status_code == 401:
                     # API key might be invalid/expired - try without key
                     if self.api_key and attempt == 0:
@@ -191,6 +206,9 @@ class CoinGeckoProvider(BaseProvider):
         Returns:
             List of normalized data for the requested metric
         """
+        if not coin_ids:
+            coin_ids = ["bitcoin"]
+
         params = {
             "ids": ",".join(coin_ids),
             "vs_currencies": vs_currency,
@@ -200,6 +218,8 @@ class CoinGeckoProvider(BaseProvider):
         }
 
         data = await self._make_request_with_retry("simple/price", params)
+        if not isinstance(data, dict):
+            raise DataNotAvailableError("CoinGecko returned an invalid payload for simple price request")
 
         logger.info(f"✅ CoinGecko: Retrieved data for {len(data)} coins (metric: {metric})")
 
@@ -479,7 +499,7 @@ class CoinGeckoProvider(BaseProvider):
         params = {
             "vs_currency": vs_currency,
             "order": order,
-            "per_page": str(per_page),
+            "per_page": str(max(1, min(250, int(per_page)))),
             "page": str(page),
             "sparkline": "false",
         }
@@ -491,6 +511,11 @@ class CoinGeckoProvider(BaseProvider):
             params["category"] = category
 
         data = await self._make_request_with_retry("coins/markets", params)
+        if not isinstance(data, list):
+            error_message = data.get("error") if isinstance(data, dict) else None
+            raise DataNotAvailableError(
+                f"CoinGecko market data returned invalid payload{f': {error_message}' if error_message else ''}"
+            )
 
         logger.info(f"✅ CoinGecko: Retrieved market data for {len(data)} coins")
 

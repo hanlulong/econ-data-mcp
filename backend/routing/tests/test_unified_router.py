@@ -314,6 +314,16 @@ class TestUnifiedRouter:
         decision = router.route("Ethereum market cap", indicators=["ethereum"])
         assert decision.provider == "CoinGecko"
 
+    def test_xrp_routes_to_coingecko(self, router):
+        """XRP/Ripple queries use CoinGecko."""
+        decision = router.route("XRP price performance over the last 6 months")
+        assert decision.provider == "CoinGecko"
+
+    def test_top_crypto_market_cap_routes_to_coingecko(self, router):
+        """Top crypto market-cap ranking queries use CoinGecko."""
+        decision = router.route("Top 10 cryptocurrencies by market cap right now")
+        assert decision.provider == "CoinGecko"
+
     # ==========================================================================
     # Property/Housing Tests
     # ==========================================================================

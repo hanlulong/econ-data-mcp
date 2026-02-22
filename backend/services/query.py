@@ -139,6 +139,41 @@ def _safe_get_source(data: List[NormalizedData]) -> str:
     return "UNKNOWN"
 
 
+def _coerce_generated_file(file_item: Any) -> Optional[GeneratedFile]:
+    """Normalize generated file payloads to GeneratedFile objects."""
+    if file_item is None:
+        return None
+    if isinstance(file_item, GeneratedFile):
+        return file_item
+
+    if isinstance(file_item, dict):
+        return GeneratedFile(
+            url=str(file_item.get("url", "") or ""),
+            name=str(file_item.get("name", "") or ""),
+            type=str(file_item.get("type", "file") or "file"),
+        )
+
+    # Handle objects with url/name/type attributes (including pydantic models).
+    url = getattr(file_item, "url", None)
+    name = getattr(file_item, "name", None)
+    file_type = getattr(file_item, "type", None)
+    if url is not None:
+        resolved_url = str(url)
+        resolved_name = str(name or resolved_url.rsplit("/", 1)[-1] or "file")
+        resolved_type = str(file_type or "file")
+        return GeneratedFile(url=resolved_url, name=resolved_name, type=resolved_type)
+
+    if isinstance(file_item, str):
+        resolved_url = file_item
+        return GeneratedFile(
+            url=resolved_url,
+            name=resolved_url.rsplit("/", 1)[-1] or "file",
+            type="file",
+        )
+
+    return None
+
+
 class QueryService:
     # Bump when cache semantics change so stale entries from old logic are not reused.
     CACHE_KEY_VERSION = "2026-02-21.2"
@@ -472,7 +507,9 @@ class QueryService:
         if not text:
             return set()
 
-        text_lower = text.lower()
+        text_lower = str(text).lower()
+        normalized_text = re.sub(r"[_/]+", " ", text_lower).replace("-", " ")
+        search_text = f"{text_lower} {normalized_text}"
         cue_map = {
             "import": {"import", "imports"},
             "export": {"export", "exports"},
@@ -499,6 +536,37 @@ class QueryService:
             "household_debt": {"household debt"},
             "unemployment": {"unemployment", "jobless"},
             "inflation": {"inflation", "consumer price", "cpi"},
+            "producer_price": {"producer price", "ppi", "wholesale price"},
+            "policy_rate": {"policy rate", "repo rate", "fed funds", "federal funds", "benchmark rate", "cash rate"},
+            "bond_yield": {
+                "bond yield",
+                "treasury yield",
+                "government bond",
+                "sovereign yield",
+                "10-year yield",
+                "10 year yield",
+                "2-year yield",
+                "2 year yield",
+                "long-term interest rate",
+                "long term interest rate",
+            },
+            "tenor_2y": {"2-year", "2 year", "2yr", "2 yr"},
+            "tenor_10y": {"10-year", "10 year", "10yr", "10 yr", "over 10 years", "maturity over 10 years"},
+            "tenor_30y": {"30-year", "30 year", "30yr", "30 yr"},
+            "money_supply": {
+                "money supply",
+                "money stock",
+                "monetary aggregate",
+                "broad money",
+                "narrow money",
+                "m1",
+                "m2",
+                "m3",
+            },
+            "reserves": {"foreign exchange reserves", "fx reserves", "reserve assets", "international reserves", "reserves"},
+            "house_prices": {"house price", "house prices", "housing prices", "property prices", "residential property"},
+            "employment_population": {"employment to population", "employment-population", "employment population ratio"},
+            "discontinued": {"discontinued", "deprecated", "legacy"},
             "savings": {"saving", "savings"},
             "credit": {"credit", "lending", "loan"},
             "exchange_rate": {"exchange rate", "forex", "fx", "reer", "neer", "effective exchange rate"},
@@ -507,7 +575,7 @@ class QueryService:
 
         cues: set[str] = set()
         for cue, phrases in cue_map.items():
-            if any(phrase in text_lower for phrase in phrases):
+            if any(phrase in search_text for phrase in phrases):
                 cues.add(cue)
         return cues
 
@@ -598,6 +666,28 @@ class QueryService:
             score -= 1.8
         if "exchange_rate" in query_cues and "exchange_rate" not in series_cues:
             score -= 1.8
+        if "money_supply" in query_cues and "money_supply" not in series_cues:
+            score -= 2.2
+        if "bond_yield" in query_cues and "bond_yield" not in series_cues:
+            score -= 2.2
+        if "tenor_2y" in query_cues and "tenor_2y" not in series_cues:
+            score -= 2.6
+        if "tenor_10y" in query_cues and "tenor_10y" not in series_cues:
+            score -= 2.6
+        if "tenor_30y" in query_cues and "tenor_30y" not in series_cues:
+            score -= 2.6
+        if "policy_rate" in query_cues and "policy_rate" not in series_cues:
+            score -= 2.0
+        if "house_prices" in query_cues and "house_prices" not in series_cues:
+            score -= 2.2
+        if "reserves" in query_cues and "reserves" not in series_cues:
+            score -= 2.0
+        if "employment_population" in query_cues and "employment_population" not in series_cues:
+            score -= 2.2
+        if "producer_price" in query_cues and "producer_price" not in series_cues:
+            score -= 2.0
+        if "discontinued" in series_cues and "discontinued" not in query_cues:
+            score -= 3.0
 
         # Generic GDP series should not dominate directional/ratio trade queries.
         if "gdp (current us$)" in series_text and ({"import", "export", "trade_balance"} & query_cues):
@@ -656,7 +746,7 @@ class QueryService:
         self,
         query: str,
         intent: ParsedIntent,
-        max_options: int = 4,
+        max_options: int = 3,
     ) -> List[str]:
         """
         Build ranked indicator options across plausible providers for user clarification.
@@ -669,7 +759,10 @@ class QueryService:
         if raw_query:
             raw_cues = self._extract_indicator_cues(raw_query)
             indicator_cues = self._extract_indicator_cues(indicator_query)
-            high_signal_raw_cues = {cue for cue in raw_cues if cue not in {"gdp"}}
+            high_signal_raw_cues = {
+                cue for cue in raw_cues
+                if cue not in {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+            }
             if (
                 ("debt_gdp_ratio" in raw_cues and "debt_gdp_ratio" not in indicator_cues)
                 or (high_signal_raw_cues and not (high_signal_raw_cues & indicator_cues))
@@ -678,7 +771,15 @@ class QueryService:
         if not indicator_query:
             return []
 
+        query_cues = self._extract_indicator_cues(raw_query or indicator_query)
+        high_signal_query_cues = {
+            cue for cue in query_cues
+            if cue not in {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+        }
+
         target_countries = self._collect_target_countries(intent.parameters)
+        if not target_countries and raw_query:
+            target_countries = self._extract_countries_from_query(raw_query)
         target_country = target_countries[0] if target_countries else None
         target_iso2 = [
             iso2
@@ -753,7 +854,13 @@ class QueryService:
                 }
             }
             relevance_score = self._score_series_relevance(query, synthetic_series)
-            if relevance_score < -2.0:
+            if relevance_score < -0.5:
+                continue
+
+            option_cues = self._extract_indicator_cues(
+                f"{resolved.name or ''} {resolved.code or ''}"
+            )
+            if high_signal_query_cues and not (high_signal_query_cues & option_cues):
                 continue
 
             combined_score = float(resolved.confidence) + (0.12 * relevance_score)
@@ -787,7 +894,28 @@ class QueryService:
         top_meta = getattr(top_series, "metadata", None)
         query_cues = self._extract_indicator_cues(query)
         top_series_cues = self._extract_indicator_cues(self._series_text_for_relevance(top_series))
-        high_signal_query_cues = {cue for cue in query_cues if cue not in {"gdp"}}
+        high_signal_query_cues = {
+            cue for cue in query_cues
+            if cue not in {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+        }
+        strict_cues = {
+            "import",
+            "export",
+            "trade_balance",
+            "debt_gdp_ratio",
+            "public_debt",
+            "money_supply",
+            "bond_yield",
+            "tenor_2y",
+            "tenor_10y",
+            "tenor_30y",
+            "policy_rate",
+            "house_prices",
+            "reserves",
+            "employment_population",
+            "producer_price",
+            "exchange_rate",
+        }
 
         # Cross-check with provider-agnostic resolver for framework-level ambiguity detection.
         # If the best canonical match disagrees with returned series/provider, ask clarification.
@@ -801,7 +929,7 @@ class QueryService:
                 countries=target_countries or None,
             )
 
-            if canonical and canonical.confidence >= 0.8 and top_meta:
+            if canonical and canonical.confidence >= 0.9 and top_meta:
                 top_provider = normalize_provider_name(getattr(top_meta, "source", "") or "")
                 canonical_provider = normalize_provider_name(canonical.provider or "")
                 top_indicator = str(getattr(top_meta, "indicator", "") or "")
@@ -825,9 +953,29 @@ class QueryService:
                     return False
 
                 if top_provider and canonical_provider and top_code and canonical_code:
-                    if top_provider != canonical_provider and top_score < 2.0:
+                    canonical_cues = self._extract_indicator_cues(
+                        f"{canonical.name or ''} {canonical.code or ''}"
+                    )
+                    cue_conflict = bool(high_signal_query_cues) and not (
+                        high_signal_query_cues & top_series_cues
+                    )
+                    canonical_supports_query = not high_signal_query_cues or bool(
+                        high_signal_query_cues & canonical_cues
+                    )
+
+                    if (
+                        top_provider != canonical_provider
+                        and cue_conflict
+                        and canonical_supports_query
+                        and top_score < 1.1
+                    ):
                         return True
-                    if not _codes_match(top_code, canonical_code) and top_score < 2.0:
+                    if (
+                        not _codes_match(top_code, canonical_code)
+                        and cue_conflict
+                        and canonical_supports_query
+                        and top_score < 0.8
+                    ):
                         return True
                     # Canonical match aligns with returned series/provider.
                     if top_provider == canonical_provider and _codes_match(top_code, canonical_code):
@@ -843,14 +991,14 @@ class QueryService:
             and ("debt_service" in top_series_cues or "credit" in top_series_cues)
         ):
             return True
-        if high_signal_query_cues and not (high_signal_query_cues & top_series_cues) and top_score < 2.0:
+        if (high_signal_query_cues & strict_cues) and not (high_signal_query_cues & top_series_cues) and top_score < 0.8:
             return True
         if top_score < 0.25:
             return True
 
         if len(scored) > 1:
             score_gap = scored[0][0] - scored[1][0]
-            if score_gap < 0.2:
+            if score_gap < 0.2 and top_score < 1.0:
                 second_series_cues = self._extract_indicator_cues(
                     self._series_text_for_relevance(scored[1][1])
                 )
@@ -874,8 +1022,6 @@ class QueryService:
             return None
 
         options = self._collect_indicator_choice_options(query, intent)
-        if len(options) < 2:
-            return None
 
         top_series = data[0] if data else None
         top_meta = getattr(top_series, "metadata", None) if top_series else None
@@ -884,6 +1030,45 @@ class QueryService:
             f"from {getattr(top_meta, 'source', 'unknown source')}"
             if top_meta else "Unknown indicator"
         )
+
+        # Ensure at least two options are available for genuinely uncertain matches.
+        if len(options) < 2 and top_meta:
+            current_code = str(getattr(top_meta, "seriesId", "") or "").strip()
+            current_provider = normalize_provider_name(getattr(top_meta, "source", "") or "")
+            current_option = (
+                f"[{current_provider}] "
+                f"{getattr(top_meta, 'indicator', 'Current match')} ({current_code or 'N/A'})"
+            )
+            if current_option not in options:
+                options.insert(0, current_option)
+
+        if len(options) < 2:
+            try:
+                resolver = get_indicator_resolver()
+                target_countries = self._collect_target_countries(intent.parameters)
+                if not target_countries:
+                    target_countries = self._extract_countries_from_query(query)
+                target_country = target_countries[0] if target_countries else None
+
+                canonical = resolver.resolve(
+                    query,
+                    country=target_country,
+                    countries=target_countries or None,
+                )
+                if canonical and canonical.code:
+                    provider_label = normalize_provider_name(canonical.provider or "")
+                    canonical_option = (
+                        f"[{provider_label}] "
+                        f"{str(canonical.name or canonical.code).replace('_', ' ').strip()} "
+                        f"({canonical.code})"
+                    )
+                    if canonical_option not in options:
+                        options.append(canonical_option)
+            except Exception:
+                pass
+
+        if len(options) < 2:
+            return None
 
         clarification_questions = [
             "I found multiple plausible indicators and the current match is uncertain.",
@@ -975,27 +1160,199 @@ class QueryService:
                 "trade_balance": ("BOP", "TRADE", "NETEXP"),
                 "import": ("IMP", "IMPORT"),
                 "export": ("EXP", "EXPORT"),
+                "money_supply": ("M1", "M2", "M3", "MZM", "MONEY", "MONETARY"),
+                "policy_rate": ("FEDFUNDS", "DFEDTAR", "DFF"),
+                "bond_yield": ("DGS", "GS", "TB3MS", "YIELD", "TREASURY"),
+                "house_prices": ("HPI", "CSUSHPI", "USSTHPI"),
+                "reserves": ("REER", "DEX", "EXCH", "RESERV"),
             }
 
             for cue, tokens in domain_tokens.items():
                 if cue in query_cues and not any(token in code_upper for token in tokens):
                     return False
 
+            query_lower = str(indicator_query or "").lower()
+            if "m1" in query_lower and "M1" not in code_upper:
+                return False
+            if "m2" in query_lower and "M2" not in code_upper:
+                return False
+            if "m3" in query_lower and "M3" not in code_upper:
+                return False
+            if ("10-year" in query_lower or "10 year" in query_lower) and not (
+                "10" in code_upper or "DGS10" in code_upper or "GS10" in code_upper
+            ):
+                return False
+            if "tenor_2y" in query_cues and not (
+                "2" in code_upper or "DGS2" in code_upper or "GS2" in code_upper
+            ):
+                return False
+            if "tenor_10y" in query_cues and not (
+                "10" in code_upper or "DGS10" in code_upper or "GS10" in code_upper
+            ):
+                return False
+            if "tenor_30y" in query_cues and not (
+                "30" in code_upper or "DGS30" in code_upper or "GS30" in code_upper
+            ):
+                return False
+
         if provider_upper == "BIS":
             # Guardrail: generic debt-to-GDP queries should not resolve to BIS debt-service series.
             if "debt_gdp_ratio" in query_cues:
-                if code_upper == "WS_DSR":
+                if code_upper in {"WS_DSR", "WS_DEBT_SEC2_PUB"}:
                     return False
-                # WS_TC is valid for BIS credit/household debt contexts, but not generic public debt.
-                if code_upper == "WS_TC" and not (
-                    query_cues & {"credit", "household_debt", "debt_service"}
-                ):
+                # Generic debt/public debt ratio queries should not stay on BIS unless
+                # they explicitly ask for credit/household/debt-service constructs.
+                if not (query_cues & {"credit", "household_debt", "debt_service"}):
+                    return False
+                # WS_TC is valid for BIS credit/household debt contexts only.
+                if code_upper == "WS_TC" and not (query_cues & {"credit", "household_debt"}):
                     return False
 
             if "debt_service" in query_cues and code_upper != "WS_DSR":
                 return False
+            if (
+                "public_debt" in query_cues
+                and code_upper.startswith("WS_")
+                and not (query_cues & {"credit", "debt_service", "household_debt"})
+            ):
+                return False
 
         return True
+
+    def _extract_series_provider_and_code(self, series: Any) -> tuple[str, str]:
+        """Extract normalized provider and provider-native code from one series."""
+        meta = getattr(series, "metadata", None) if series is not None else None
+        if not meta:
+            return "", ""
+
+        provider = normalize_provider_name(str(getattr(meta, "source", "") or ""))
+        series_id = str(getattr(meta, "seriesId", "") or "").strip()
+        indicator = str(getattr(meta, "indicator", "") or "").strip()
+        if series_id:
+            return provider, series_id
+        if indicator and self._looks_like_provider_indicator_code(provider, indicator):
+            return provider, indicator
+        return provider, ""
+
+    def _has_implausible_top_series(self, query: str, data: List[Any]) -> bool:
+        """
+        Check whether top-ranked result is semantically implausible for the query.
+
+        This is used as a post-agent guardrail before final response emission.
+        """
+        if not data:
+            return False
+
+        provider, code = self._extract_series_provider_and_code(data[0])
+        if not provider or not code:
+            return False
+
+        return not self._is_resolved_indicator_plausible(
+            provider=provider,
+            indicator_query=query,
+            resolved_code=code,
+        )
+
+    def _normalize_bis_metadata_labels(self, data: List[Any]) -> None:
+        """
+        Replace opaque BIS indicator codes with human-readable labels when possible.
+
+        Applies both to fresh and cached responses so user-facing metadata stays clear.
+        """
+        if not data:
+            return
+
+        for series in data:
+            metadata = getattr(series, "metadata", None) if series is not None else None
+            if not metadata:
+                continue
+
+            source = normalize_provider_name(str(getattr(metadata, "source", "") or ""))
+            if source != "BIS":
+                continue
+
+            indicator_value = str(getattr(metadata, "indicator", "") or "").strip()
+            series_id_value = str(getattr(metadata, "seriesId", "") or "").strip().upper()
+            code_value = series_id_value
+            if not code_value:
+                indicator_upper = indicator_value.upper()
+                if indicator_upper.startswith("WS_"):
+                    code_value = indicator_upper
+
+            if not code_value:
+                continue
+
+            name, description = self.bis_provider._lookup_dataflow_info(code_value)
+            if name and (not indicator_value or indicator_value.upper() == code_value):
+                metadata.indicator = name
+            if description and not getattr(metadata, "description", None):
+                metadata.description = description
+
+    def _apply_concept_provider_override(
+        self,
+        provider: str,
+        intent: ParsedIntent,
+        params: dict,
+    ) -> tuple[str, dict]:
+        """
+        Re-route provider using catalog concept availability from the original query.
+
+        This prevents semantically impossible provider/concept combinations from
+        continuing into indicator resolution (e.g., public debt ratio on BIS).
+        """
+        original_query = str(intent.originalQuery or "").strip()
+        explicit_provider_requested = normalize_provider_name(
+            self._detect_explicit_provider(original_query) or ""
+        )
+        if explicit_provider_requested and explicit_provider_requested == provider:
+            return provider, params
+
+        concept_query = original_query or self._select_indicator_query_for_resolution(intent)
+        if not concept_query:
+            return provider, params
+
+        try:
+            from .catalog_service import find_concept_by_term, get_best_provider, is_provider_available
+
+            concept_name = find_concept_by_term(concept_query)
+            if not concept_name:
+                return provider, params
+            if is_provider_available(concept_name, provider):
+                return provider, params
+
+            countries_ctx = params.get("countries") if isinstance(params.get("countries"), list) else None
+            if not countries_ctx:
+                country_value = params.get("country") or params.get("region")
+                countries_ctx = [country_value] if country_value else None
+
+            alt_provider, alt_code, _ = get_best_provider(concept_name, countries_ctx)
+            alt_provider_normalized = normalize_provider_name(alt_provider or "")
+            if not alt_provider_normalized or alt_provider_normalized == provider:
+                return provider, params
+
+            logger.info(
+                "📋 Concept override: provider %s is not available for '%s'; rerouting to %s",
+                provider,
+                concept_name,
+                alt_provider_normalized,
+            )
+            provider = alt_provider_normalized
+            intent.apiProvider = alt_provider or provider
+
+            if alt_code:
+                params = {**params, "indicator": alt_code}
+                intent.parameters = params
+                if not intent.indicators or len(intent.indicators) <= 1:
+                    intent.indicators = [alt_code]
+                logger.info(
+                    "📋 Concept override indicator: %s -> %s",
+                    concept_query,
+                    alt_code,
+                )
+        except Exception as exc:
+            logger.debug("Concept provider override skipped: %s", exc)
+
+        return provider, params
 
     def _indicator_resolution_threshold(self, indicator_query: str, resolved_source: str) -> float:
         """
@@ -1036,6 +1393,11 @@ class QueryService:
         if not original_query:
             return indicator_query
 
+        indicator_lower = indicator_query.lower()
+        if any(term in indicator_lower for term in ("discontinued", "deprecated", "legacy")):
+            logger.info("🔎 Parsed indicator appears deprecated/discontinued. Using original query.")
+            return original_query
+
         ratio_patterns = [
             "% of gdp",
             "as % of gdp",
@@ -1047,7 +1409,6 @@ class QueryService:
             "as share of gdp",
         ]
         original_lower = original_query.lower()
-        indicator_lower = indicator_query.lower()
         has_ratio_original = any(pattern in original_lower for pattern in ratio_patterns)
         has_ratio_indicator = any(pattern in indicator_lower for pattern in ratio_patterns)
         if has_ratio_original and not has_ratio_indicator:
@@ -2281,6 +2642,9 @@ class QueryService:
         params = intent.parameters or {}
         tracker = get_processing_tracker()
 
+        provider, params = self._apply_concept_provider_override(provider, intent, params)
+        intent.parameters = params
+
         # PHASE B: Use IndicatorResolver as the unified entry point for indicator resolution
         # This replaces scattered resolution logic across providers
         resolver = get_indicator_resolver()
@@ -2294,6 +2658,27 @@ class QueryService:
                 existing_indicator
                 and self._looks_like_provider_indicator_code(provider, existing_indicator)
             )
+
+            if has_explicit_code:
+                plausibility_query = self._select_indicator_query_for_resolution(intent)
+                if not plausibility_query:
+                    plausibility_query = str(intent.originalQuery or "").strip()
+                if not plausibility_query:
+                    plausibility_query = str(intent.indicators[0] if intent.indicators else existing_indicator)
+
+                if plausibility_query and not self._is_resolved_indicator_plausible(
+                    provider=provider,
+                    indicator_query=plausibility_query,
+                    resolved_code=existing_indicator,
+                ):
+                    logger.info(
+                        "🔎 Explicit %s indicator '%s' conflicts with query context '%s'; attempting dynamic resolution",
+                        provider,
+                        existing_indicator,
+                        plausibility_query,
+                    )
+                    has_explicit_code = False
+
             if has_explicit_code:
                 # Respect explicit provider-native series IDs from upstream parse/routing.
                 logger.info(
@@ -2436,6 +2821,7 @@ class QueryService:
         if cached:
             logger.info("Cache hit for %s", provider)
             result_list = cached if isinstance(cached, list) else [cached]
+            self._normalize_bis_metadata_labels(result_list)
             if tracker:
                 with tracker.track(
                     "cache_hit",
@@ -3079,8 +3465,27 @@ class QueryService:
                             params.pop("endDate", None)
 
                 # Determine query type based on indicators or params
-                coin_ids = params.get("coinIds", [])
-                vs_currency = params.get("vsCurrency", "usd")
+                raw_coin_ids = params.get("coinIds")
+                if isinstance(raw_coin_ids, list):
+                    coin_ids = [str(cid).strip() for cid in raw_coin_ids if str(cid).strip()]
+                elif isinstance(raw_coin_ids, str):
+                    coin_ids = [part.strip() for part in raw_coin_ids.split(",") if part.strip()]
+                else:
+                    coin_ids = []
+
+                raw_vs_currency = str(params.get("vsCurrency") or "usd").strip().lower()
+                invalid_currency_tokens = {
+                    "right", "now", "today", "current", "recent", "latest",
+                    "trend", "performance", "history", "historical",
+                }
+                if (
+                    raw_vs_currency in invalid_currency_tokens
+                    or not re.fullmatch(r"[a-z]{3,10}", raw_vs_currency)
+                ):
+                    vs_currency = "usd"
+                else:
+                    vs_currency = raw_vs_currency
+                params["vsCurrency"] = vs_currency
 
                 logger.info(f"   - Initial coin_ids: {coin_ids}")
                 logger.info(f"   - vs_currency: {vs_currency}")
@@ -3222,6 +3627,7 @@ class QueryService:
                         # Extract N from query (e.g., "top 10")
                         top_n_match = re.search(r'top\s+(\d+)', query_lower)
                         per_page = int(top_n_match.group(1)) if top_n_match else 10
+                        per_page = max(1, min(250, per_page))
 
                         result = await self.coingecko_provider.get_market_data(
                             vs_currency=vs_currency,
@@ -3289,6 +3695,8 @@ class QueryService:
                 f"No data available from {provider} for the requested parameters. "
                 f"The data may not exist or may not be available for the specified time period or location."
             )
+
+        self._normalize_bis_metadata_labels(result)
 
         # Validate data before returning (fundamental data quality check)
         from backend.services.data_validator import get_data_validator
@@ -3987,14 +4395,7 @@ class QueryService:
                 raw_files = code_exec.get("files", [])
                 files = None
                 if raw_files:
-                    files = [
-                        GeneratedFile(
-                            url=f.get("url", "") if isinstance(f, dict) else f,
-                            name=f.get("name", "") if isinstance(f, dict) else f.split("/")[-1],
-                            type=f.get("type", "file") if isinstance(f, dict) else "file",
-                        )
-                        for f in raw_files
-                    ]
+                    files = [gf for gf in (_coerce_generated_file(f) for f in raw_files) if gf is not None]
                 return QueryResponse(
                     conversationId=conversation_id,
                     clarificationNeeded=False,
@@ -4034,6 +4435,19 @@ class QueryService:
                         "Retrying via standard pipeline.",
                         sorted(query_cues),
                         sorted(result_cues),
+                    )
+                    return await self._standard_query_processing(
+                        query,
+                        conversation_id,
+                        tracker,
+                        record_user_message=False,
+                    )
+
+                if self._has_implausible_top_series(query, data):
+                    logger.warning(
+                        "LangGraph top series failed plausibility guard for query '%s'. "
+                        "Retrying via standard pipeline.",
+                        query,
                     )
                     return await self._standard_query_processing(
                         query,

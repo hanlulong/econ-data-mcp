@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 import logging
 import asyncio
+import re
 
 import httpx
 
@@ -664,6 +665,19 @@ class ComtradeProvider(BaseProvider):
 
         return results
 
+    @staticmethod
+    def _split_location_input(value: str) -> List[str]:
+        """
+        Split comma/semicolon-separated country input into individual tokens.
+
+        Handles parser outputs like "Germany, Netherlands" without forcing users
+        to resend the query as an explicit list.
+        """
+        if not value:
+            return []
+        chunks = re.split(r"[;,]", str(value))
+        return [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
+
     async def fetch_trade_data(
         self,
         reporter: Optional[str] = None,
@@ -697,6 +711,14 @@ class ComtradeProvider(BaseProvider):
 
         # Support both single reporter and multiple reporters
         reporter_list = reporters or [reporter or "US"]
+        normalized_reporters: List[str] = []
+        for reporter_item in reporter_list:
+            split_items = self._split_location_input(str(reporter_item))
+            if split_items:
+                normalized_reporters.extend(split_items)
+            else:
+                normalized_reporters.append(str(reporter_item))
+        reporter_list = normalized_reporters or [reporter or "US"]
 
         # Expand region names to individual countries using CountryResolver
         from ..routing.country_resolver import CountryResolver
@@ -733,9 +755,17 @@ class ComtradeProvider(BaseProvider):
 
         partner_inputs: List[str] = []
         if isinstance(partner, list):
-            partner_inputs = [str(p) for p in partner if p]
+            for partner_item in partner:
+                if not partner_item:
+                    continue
+                split_items = self._split_location_input(str(partner_item))
+                if split_items:
+                    partner_inputs.extend(split_items)
+                else:
+                    partner_inputs.append(str(partner_item))
         elif partner:
-            partner_inputs = [str(partner)]
+            split_items = self._split_location_input(str(partner))
+            partner_inputs = split_items if split_items else [str(partner)]
 
         # Taiwan Special Handling: Taiwan (490) is a non-reporting territory
         # If Taiwan is the reporter, we need to flip to partner perspective

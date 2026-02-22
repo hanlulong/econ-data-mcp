@@ -207,7 +207,8 @@ class IndicatorResolver:
 
         # Try resolution methods in priority order
         result = None
-        query_concept = find_concept_by_term(query)
+        concept_query = self._normalize_query_for_concept_lookup(query)
+        query_concept = find_concept_by_term(concept_query) or find_concept_by_term(query)
         preferred_catalog_codes: Set[str] = set()
         if provider and query_concept:
             preferred_catalog_codes = {
@@ -369,12 +370,18 @@ class IndicatorResolver:
 
         # 6. Try CatalogService fallback
         should_try_catalog = (not result) or (result and result.confidence < 0.6)
-        if result and query_concept and preferred_catalog_codes and result.source == "database":
+        if result and query_concept and preferred_catalog_codes:
             result_code = self._normalize_code(result.code)
-            # If a known-concept/provider query resolved to an off-catalog code with only
-            # moderate confidence, fall back to catalog canonical mapping.
-            if result_code and result_code not in preferred_catalog_codes and result.confidence < 0.70:
-                should_try_catalog = True
+            if result_code and result_code not in preferred_catalog_codes:
+                # For known-concept/provider queries, prefer canonical catalog mappings unless
+                # the off-catalog match is very strong.
+                off_catalog_threshold = 0.78
+                if result.source == "translator":
+                    off_catalog_threshold = 0.90
+                elif result.source == "database":
+                    off_catalog_threshold = 0.78
+                if result.confidence < off_catalog_threshold:
+                    should_try_catalog = True
 
         if should_try_catalog and query_concept:
             if provider and is_provider_available(query_concept, provider):
@@ -741,6 +748,13 @@ class IndicatorResolver:
             return ""
         return str(code).strip().upper()
 
+    @staticmethod
+    def _normalize_query_for_concept_lookup(query: str) -> str:
+        """Normalize text form for catalog concept lookup."""
+        normalized = re.sub(r"[_/]+", " ", str(query or "").strip().lower()).replace("-", " ")
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
     def _score_search_match(self, query: str, candidate: Dict[str, Any], rank_index: int = 0) -> float:
         """
         Score a candidate search result on a 0-1 relevance scale.
@@ -760,6 +774,7 @@ class IndicatorResolver:
         query_terms = self._tokenize_terms(query_text)
         candidate_terms = self._tokenize_terms(f"{name} {code} {description}")
         name_terms = self._tokenize_terms(f"{name} {code}")
+        candidate_text_lower = f"{name} {code} {description}".lower()
 
         if not query_terms:
             return 0.0
@@ -865,6 +880,114 @@ class IndicatorResolver:
         # Mild penalty when core terms only appear in long descriptions.
         if core_query_terms and effective_core_overlap_count > 0 and effective_core_name_overlap_count == 0:
             confidence -= 0.06
+
+        # Monetary aggregate disambiguation (M1/M2/M3 should map to matching aggregate series).
+        for aggregate in ("m1", "m2", "m3"):
+            query_has_aggregate = bool(re.search(rf"\b{aggregate}\b", query_text))
+            candidate_has_aggregate = bool(re.search(rf"\b{aggregate}\b", candidate_text_lower))
+            if query_has_aggregate and candidate_has_aggregate:
+                confidence += 0.24
+            elif query_has_aggregate and not candidate_has_aggregate:
+                confidence -= 0.72
+
+        # Employment-to-population queries require employment subject, not population-only series.
+        query_has_employment_population_ratio = (
+            ("employment" in query_terms)
+            and ("population" in query_terms)
+            and bool({"ratio", "rate"} & set(re.findall(r"[a-z0-9]+", query_text)))
+        )
+        if query_has_employment_population_ratio and "employment" not in candidate_terms:
+            confidence -= 0.34
+
+        # Bond yield/long-term rate disambiguation.
+        bond_yield_query = any(
+            phrase in query_text
+            for phrase in (
+                "bond yield",
+                "treasury yield",
+                "government bond",
+                "sovereign yield",
+                "10-year",
+                "10 year",
+                "long-term interest rate",
+                "long term interest rate",
+            )
+        )
+        if bond_yield_query and not any(
+            token in candidate_text_lower
+            for token in (
+                "bond",
+                "yield",
+                "treasury",
+                "10-year",
+                "10 year",
+                "long-term",
+                "long term",
+            )
+        ):
+            confidence -= 0.32
+        if bond_yield_query and any(
+            token in candidate_text_lower
+            for token in (
+                "federal funds",
+                "policy rate",
+                "benchmark rate",
+                "overnight",
+                "interbank",
+            )
+        ):
+            confidence -= 0.36
+
+        # Producer-price requests should not degrade to consumer inflation.
+        producer_price_query = (
+            ("producer" in query_terms and "price" in query_terms)
+            or "ppi" in query_terms
+        )
+        if producer_price_query and not (
+            "producer" in candidate_terms or "ppi" in candidate_terms or "wholesale" in candidate_terms
+        ):
+            confidence -= 0.28
+
+        # Debt-to-GDP requests should not degrade into debt-service or debt-securities datasets.
+        debt_gdp_query = any(
+            phrase in query_text
+            for phrase in (
+                "debt to gdp",
+                "debt-to-gdp",
+                "debt as % of gdp",
+                "debt as percentage of gdp",
+                "gdp to debt ratio",
+                "gdp/debt ratio",
+            )
+        )
+        if debt_gdp_query:
+            if not any(
+                token in candidate_text_lower
+                for token in (
+                    "gdp",
+                    "% of gdp",
+                    "percent of gdp",
+                    "debt-to-gdp",
+                    "debt to gdp",
+                    "government debt",
+                    "public debt",
+                )
+            ):
+                confidence -= 0.38
+            if any(
+                token in candidate_text_lower
+                for token in (
+                    "debt service",
+                    "dsr",
+                    "debt securities",
+                    "international debt securities",
+                )
+            ):
+                confidence -= 0.45
+
+        # Prefer active series unless the query explicitly asks for discontinued data.
+        if "discontinued" in candidate_text_lower and "discontinued" not in query_text:
+            confidence -= 0.42
 
         # Guardrail: single-term lexical hits are often semantically ambiguous
         # (e.g., "custom indicator" matching "customs and trade ...").
