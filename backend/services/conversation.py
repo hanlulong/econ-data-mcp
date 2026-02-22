@@ -32,6 +32,24 @@ class ConversationManager:
         self._conversations: Dict[str, ConversationContext] = {}
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _is_expired(self, conversation: ConversationContext, now: Optional[datetime] = None) -> bool:
+        # Use last activity time so active conversations do not expire mid-session.
+        check_time = now or self._now()
+        return check_time - conversation.updated_at > self.MAX_AGE
+
+    def _get_locked(self, conversation_id: str) -> Optional[ConversationContext]:
+        conversation = self._conversations.get(conversation_id)
+        if not conversation:
+            return None
+        if self._is_expired(conversation):
+            self._conversations.pop(conversation_id, None)
+            return None
+        return conversation
+
     def create_conversation(self) -> str:
         conversation_id = str(uuid.uuid4())
         with self._lock:
@@ -40,25 +58,21 @@ class ConversationManager:
 
     def _get(self, conversation_id: str) -> Optional[ConversationContext]:
         with self._lock:
-            conversation = self._conversations.get(conversation_id)
-            if not conversation:
-                return None
-            if datetime.now(timezone.utc) - conversation.created_at > self.MAX_AGE:
-                self._conversations.pop(conversation_id, None)
-                return None
-            return conversation
+            return self._get_locked(conversation_id)
 
     def add_message(self, conversation_id: str, role: str, content: str, intent: Optional[ParsedIntent] = None) -> None:
-        conversation = self._get(conversation_id)
-        if not conversation:
-            raise ValueError("Conversation not found")
+        with self._lock:
+            conversation = self._get_locked(conversation_id)
+            if not conversation:
+                raise ValueError("Conversation not found")
 
-        conversation.messages.append(
-            ConversationMessage(role=role, content=content, timestamp=datetime.now(timezone.utc))
-        )
-        if intent:
-            conversation.last_intent = intent
-        conversation.updated_at = datetime.now(timezone.utc)
+            now = self._now()
+            conversation.messages.append(
+                ConversationMessage(role=role, content=content, timestamp=now)
+            )
+            if intent:
+                conversation.last_intent = intent
+            conversation.updated_at = now
 
     def add_message_safe(
         self,
@@ -92,10 +106,11 @@ class ConversationManager:
             return new_id
 
     def get_history(self, conversation_id: str) -> List[str]:
-        conversation = self._get(conversation_id)
-        if not conversation:
-            return []
-        return [message.content for message in conversation.messages]
+        with self._lock:
+            conversation = self._get_locked(conversation_id)
+            if not conversation:
+                return []
+            return [message.content for message in list(conversation.messages)]
 
     def get_messages(self, conversation_id: str) -> List[Dict[str, str]]:
         """
@@ -104,13 +119,14 @@ class ConversationManager:
         Returns:
             List of message dicts with 'role' and 'content' keys
         """
-        conversation = self._get(conversation_id)
-        if not conversation:
-            return []
-        return [
-            {"role": msg.role, "content": msg.content}
-            for msg in conversation.messages
-        ]
+        with self._lock:
+            conversation = self._get_locked(conversation_id)
+            if not conversation:
+                return []
+            return [
+                {"role": msg.role, "content": msg.content}
+                for msg in list(conversation.messages)
+            ]
 
     def get_or_create(self, conversation_id: Optional[str]) -> str:
         """
@@ -139,10 +155,11 @@ class ConversationManager:
 
     def cleanup(self) -> None:
         with self._lock:
+            now = self._now()
             expired = [
                 cid
                 for cid, context in self._conversations.items()
-                if datetime.now(timezone.utc) - context.created_at > self.MAX_AGE
+                if self._is_expired(context, now)
             ]
             for cid in expired:
                 self._conversations.pop(cid, None)

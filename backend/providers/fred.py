@@ -231,6 +231,12 @@ class FREDProvider(BaseProvider):
         "TOTAL_CONSUMER_CREDIT": "TOTALSL",
         "CONSUMER_DEBT": "TOTALSL",  # Changed from HDTGPDUSQ163N
         "CONSUMER_LOANS": "TOTALSL",
+        "BANK_LENDING": "TOTBKCR",  # Commercial Bank Credit, All Commercial Banks
+        "BANK_LENDING_GROWTH": "TOTBKCR",
+        "BANK_CREDIT": "TOTBKCR",
+        "BANK_CREDIT_GROWTH": "TOTBKCR",
+        "COMMERCIAL_BANK_CREDIT": "TOTBKCR",
+        "LENDING": "TOTBKCR",
         "REVOLVING_CREDIT": "REVOLSL",  # Revolving Consumer Credit (credit cards)
         "CREDIT_CARD_DEBT": "REVOLSL",
         "NON_REVOLVING_CREDIT": "NONREVSL",  # Nonrevolving Consumer Credit (auto, student loans)
@@ -518,6 +524,13 @@ class FREDProvider(BaseProvider):
         """
         # If explicit series ID provided, use it (check for transformation suffix)
         if series_id:
+            normalized_series = series_id.upper().strip().replace(" ", "_")
+            if normalized_series in self.SERIES_MAPPINGS:
+                mapping = self.SERIES_MAPPINGS[normalized_series]
+                if ":" in mapping:
+                    parts = mapping.split(":", 1)
+                    return parts[0], parts[1]
+                return mapping, None
             if ":" in series_id:
                 parts = series_id.split(":", 1)
                 return parts[0], parts[1]

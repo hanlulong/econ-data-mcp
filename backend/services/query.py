@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -193,6 +193,8 @@ class QueryService:
 
         # Deterministic baseline router (single source of routing truth).
         self.unified_router = UnifiedRouter()
+        # Small in-memory cache to avoid repeated cross-provider fallback scans.
+        self._fallback_provider_cache: Dict[Tuple[str, str, Tuple[str, ...]], List[str]] = {}
 
     def _detect_explicit_provider(self, query: str) -> Optional[str]:
         """
@@ -316,6 +318,7 @@ class QueryService:
         routed_provider = normalize_provider_name(intent.apiProvider or "")
         deterministic_confidence = 0.0
         deterministic_match_type = "legacy"
+        deterministic_decision = None
         try:
             deterministic_decision = self.unified_router.route(
                 query=query,
@@ -354,6 +357,7 @@ class QueryService:
                     country=params.get("country"),
                     countries=countries,
                     llm_provider_hint=intent.apiProvider,
+                    baseline_decision=deterministic_decision,
                 )
                 semantic_provider = normalize_provider_name(decision.provider)
                 semantic_provider = ProviderRouter.correct_coingecko_misrouting(
@@ -906,8 +910,11 @@ class QueryService:
             return bool(re.fullmatch(r"[A-Z]{2}\.[A-Z0-9]{2,}(?:\.[A-Z0-9]{2,}){1,4}", code_upper))
 
         if provider_upper == "BIS":
-            # Examples: WS_CBPOL, WS_SPP
-            return code_upper.startswith("WS_")
+            # Examples: WS_CBPOL, WS_SPP, BIS.CBPOL
+            return bool(
+                code_upper.startswith("WS_")
+                or re.fullmatch(r"BIS\.[A-Z0-9_]{3,}", code_upper)
+            )
 
         if provider_upper == "IMF":
             # IMF codes are often uppercase with underscores/dots.
@@ -1369,6 +1376,24 @@ class QueryService:
             List of fallback provider names to try in order
         """
         primary_upper = primary_provider.upper()
+        cache_key: Optional[Tuple[str, str, Tuple[str, ...]]] = None
+        if indicator:
+            normalized_geo = tuple(
+                sorted({
+                    self._normalize_country_to_iso2(str(c)) or str(c).strip().upper()
+                    for c in [*(countries or []), country]
+                    if c
+                })
+            )
+            cache_key = (
+                primary_upper,
+                str(indicator).strip().lower(),
+                normalized_geo,
+            )
+            cached = self._fallback_provider_cache.get(cache_key)
+            if cached:
+                return list(cached)
+
         fallback_list = []
         try:
             fallback_list = [
@@ -1422,7 +1447,10 @@ class QueryService:
                     # Merge: resolver-based first, then general fallbacks
                     combined = resolver_providers + [p for p in fallback_list if p not in resolver_providers]
                     logger.info(f"🔍 Smart fallback for '{indicator}': {combined[:5]}")
-                    return combined[:5]  # Limit to 5 fallbacks
+                    result = combined[:5]  # Limit to 5 fallbacks
+                    if cache_key:
+                        self._fallback_provider_cache[cache_key] = result
+                    return result
 
             except Exception as e:
                 logger.debug(f"IndicatorResolver fallback search failed: {e}")
@@ -1436,10 +1464,14 @@ class QueryService:
                     compat_providers = [p for p, _, _ in compat_fallbacks]
                     combined = compat_providers + [p for p in fallback_list if p not in compat_providers]
                     logger.debug(f"Using catalog fallbacks for '{indicator}': {combined}")
+                    if cache_key:
+                        self._fallback_provider_cache[cache_key] = combined
                     return combined
             except Exception as e:
                 logger.debug(f"Could not get catalog-based fallbacks: {e}")
 
+        if cache_key:
+            self._fallback_provider_cache[cache_key] = fallback_list
         return fallback_list
 
     def _get_fallback_provider(self, primary_provider: str) -> Optional[str]:
@@ -1864,7 +1896,14 @@ class QueryService:
         logger.error(f"All fallbacks failed for {primary_provider}")
         raise primary_error  # Raise original error
 
-    async def process_query(self, query: str, conversation_id: Optional[str] = None, auto_pro_mode: bool = True, use_orchestrator: bool = False) -> QueryResponse:
+    async def process_query(
+        self,
+        query: str,
+        conversation_id: Optional[str] = None,
+        auto_pro_mode: bool = True,
+        use_orchestrator: bool = False,
+        allow_orchestrator: bool = True,
+    ) -> QueryResponse:
         # Check if there's already an active tracker (e.g., from streaming endpoint)
         existing_tracker = get_processing_tracker()
         if existing_tracker:
@@ -1882,7 +1921,7 @@ class QueryService:
             # Check if LangChain orchestrator should be used
             from ..config import get_settings
             settings = get_settings()
-            if use_orchestrator or settings.use_langchain_orchestrator:
+            if allow_orchestrator and (use_orchestrator or settings.use_langchain_orchestrator):
                 logger.info("🤖 Using LangChain orchestrator for intelligent query routing")
                 return await self._execute_with_orchestrator(query, conv_id, tracker)
 
@@ -2140,7 +2179,7 @@ class QueryService:
                     if fallback_data:
                         logger.info("✅ Fallback succeeded!")
                         return QueryResponse(
-                            conversationId=conversation_id or "",
+                            conversationId=conv_id,
                             intent=intent,
                             data=fallback_data,
                             clarificationNeeded=False,
@@ -2154,7 +2193,7 @@ class QueryService:
                 str(exc), query, intent if 'intent' in locals() else None
             )
             return QueryResponse(
-                conversationId=conversation_id or "",
+                conversationId=conv_id,
                 clarificationNeeded=False,
                 error="data_not_available",
                 message=formatted_message,
@@ -2171,7 +2210,7 @@ class QueryService:
                     if fallback_data:
                         logger.info("✅ Fallback succeeded after error!")
                         return QueryResponse(
-                            conversationId=conversation_id or "",
+                            conversationId=conv_id,
                             intent=intent,
                             data=fallback_data,
                             clarificationNeeded=False,
@@ -2185,7 +2224,7 @@ class QueryService:
                 str(exc), query, intent if 'intent' in locals() else None
             )
             return QueryResponse(
-                conversationId=conversation_id or "",
+                conversationId=conv_id,
                 clarificationNeeded=False,
                 error="processing_error",
                 message=formatted_message,
@@ -2280,74 +2319,83 @@ class QueryService:
         # values can be noisy (raw query text, wrong provider code, or invalid pseudo-codes).
         if provider in {"STATSCAN", "STATISTICS CANADA", "FRED", "IMF", "WORLDBANK", "EUROSTAT", "OECD", "BIS"}:
             existing_indicator = str(params.get("indicator") or "").strip()
-            indicator_query = self._select_indicator_query_for_resolution(intent)
-            if not indicator_query and intent.indicators:
-                indicator_query = str(intent.indicators[0] or "").strip()
-            if not indicator_query:
-                indicator_query = existing_indicator
-
-            if indicator_query:
-                country_context = params.get("country")
-                countries_context = params.get("countries") if isinstance(params.get("countries"), list) else None
-                original_query_text = str(intent.originalQuery or "").strip()
-                selected_original_override = (
-                    bool(original_query_text)
-                    and indicator_query == original_query_text
-                    and bool(intent.indicators)
-                    and indicator_query != str(intent.indicators[0] or "").strip()
+            has_explicit_code = bool(
+                existing_indicator
+                and self._looks_like_provider_indicator_code(provider, existing_indicator)
+            )
+            if has_explicit_code:
+                # Respect explicit provider-native series IDs from upstream parse/routing.
+                logger.info(
+                    "🔒 Keeping explicit %s indicator code: %s",
+                    provider,
+                    existing_indicator,
                 )
+                params = {**params, "indicator": existing_indicator}
+                intent.parameters = params
+            else:
+                indicator_query = self._select_indicator_query_for_resolution(intent)
+                if not indicator_query and intent.indicators:
+                    indicator_query = str(intent.indicators[0] or "").strip()
+                if not indicator_query:
+                    indicator_query = existing_indicator
 
-                resolved = resolver.resolve(
-                    indicator_query,
-                    provider=provider,
-                    country=country_context,
-                    countries=countries_context,
-                )
-
-                accepted_resolved = False
-                if resolved:
-                    threshold = self._indicator_resolution_threshold(
-                        indicator_query=indicator_query,
-                        resolved_source=resolved.source,
+                if indicator_query:
+                    country_context = params.get("country")
+                    countries_context = params.get("countries") if isinstance(params.get("countries"), list) else None
+                    original_query_text = str(intent.originalQuery or "").strip()
+                    selected_original_override = (
+                        bool(original_query_text)
+                        and indicator_query == original_query_text
+                        and bool(intent.indicators)
+                        and indicator_query != str(intent.indicators[0] or "").strip()
                     )
-                    accepted_resolved = resolved.confidence >= threshold
-                    if accepted_resolved and not self._is_resolved_indicator_plausible(
-                        provider=provider,
-                        indicator_query=indicator_query,
-                        resolved_code=resolved.code,
-                    ):
-                        accepted_resolved = False
-                    logger.info(
-                        "🔍 IndicatorResolver candidate: '%s' → '%s' (conf=%.2f, src=%s, threshold=%.2f, accepted=%s)",
+
+                    resolved = resolver.resolve(
                         indicator_query,
-                        resolved.code,
-                        resolved.confidence,
-                        resolved.source,
-                        threshold,
-                        accepted_resolved,
+                        provider=provider,
+                        country=country_context,
+                        countries=countries_context,
                     )
 
-                if accepted_resolved and resolved:
-                    params = {**params, "indicator": resolved.code}
-                    # World Bank fetch path can iterate raw intent.indicators when multiple
-                    # are present. If we intentionally overrode to original query for better
-                    # semantic alignment, collapse to the resolved indicator to avoid
-                    # reintroducing LLM-parsed mismatched indicators.
-                    if provider in {"WORLDBANK", "WORLD BANK"} and selected_original_override and len(intent.indicators) > 1:
-                        logger.info(
-                            "🔎 Collapsing World Bank multi-indicator intent to resolved indicator '%s' after semantic override",
-                            resolved.code,
+                    accepted_resolved = False
+                    if resolved:
+                        threshold = self._indicator_resolution_threshold(
+                            indicator_query=indicator_query,
+                            resolved_source=resolved.source,
                         )
-                        intent.indicators = [resolved.code]
-                else:
-                    # Keep provider-native explicit indicator codes when present;
-                    # otherwise use the best available natural-language indicator query.
-                    if existing_indicator and self._looks_like_provider_indicator_code(provider, existing_indicator):
-                        params = {**params, "indicator": existing_indicator}
+                        accepted_resolved = resolved.confidence >= threshold
+                        if accepted_resolved and not self._is_resolved_indicator_plausible(
+                            provider=provider,
+                            indicator_query=indicator_query,
+                            resolved_code=resolved.code,
+                        ):
+                            accepted_resolved = False
+                        logger.info(
+                            "🔍 IndicatorResolver candidate: '%s' → '%s' (conf=%.2f, src=%s, threshold=%.2f, accepted=%s)",
+                            indicator_query,
+                            resolved.code,
+                            resolved.confidence,
+                            resolved.source,
+                            threshold,
+                            accepted_resolved,
+                        )
+
+                    if accepted_resolved and resolved:
+                        params = {**params, "indicator": resolved.code}
+                        # World Bank fetch path can iterate raw intent.indicators when multiple
+                        # are present. If we intentionally overrode to original query for better
+                        # semantic alignment, collapse to the resolved indicator to avoid
+                        # reintroducing LLM-parsed mismatched indicators.
+                        if provider in {"WORLDBANK", "WORLD BANK"} and selected_original_override and len(intent.indicators) > 1:
+                            logger.info(
+                                "🔎 Collapsing World Bank multi-indicator intent to resolved indicator '%s' after semantic override",
+                                resolved.code,
+                            )
+                            intent.indicators = [resolved.code]
                     else:
                         params = {**params, "indicator": indicator_query}
 
-                intent.parameters = params  # ensure downstream consumers see indicator
+                    intent.parameters = params  # ensure downstream consumers see indicator
 
         # Check catalog availability: if provider is in not_available list for this indicator,
         # proactively re-route to a better provider before wasting time on failed API calls
@@ -3367,7 +3415,14 @@ class QueryService:
             conversation_history = conversation_manager.get_messages(conversation_id)
 
             # Add current query to history
-            conversation_manager.add_message_safe(conversation_id, "user", query)
+            updated_conversation_id = conversation_manager.add_message_safe(
+                conversation_id,
+                "user",
+                query,
+            )
+            if updated_conversation_id != conversation_id:
+                conversation_id = updated_conversation_id
+                conversation_history = conversation_manager.get_messages(conversation_id)
 
             # Deep Agents mode - for complex multi-step queries with planning
             if use_deep_agents and self._should_use_deep_agents(query):
@@ -3445,7 +3500,7 @@ class QueryService:
                 query_type = result.get("query_type", "standard")
 
                 # Add to conversation history
-                conversation_manager.add_message_safe(
+                conversation_id = conversation_manager.add_message_safe(
                     conversation_id,
                     "assistant",
                     f"LangChain Orchestrator: {output[:200]}..."
@@ -3557,7 +3612,12 @@ class QueryService:
             logger.exception("LangChain orchestrator error")
             # Fall back to standard processing
             logger.warning("Falling back to standard query processing")
-            return await self._standard_query_processing(query, conversation_id, tracker)
+            return await self._standard_query_processing(
+                query,
+                conversation_id,
+                tracker,
+                record_user_message=False,
+            )
 
     def _should_use_deep_agents(self, query: str) -> bool:
         """
@@ -3763,7 +3823,7 @@ class QueryService:
                     message = f"Completed {completed}/{len(todos)} planned tasks"
 
                 # Add to conversation history
-                conversation_manager.add_message_safe(
+                conversation_id = conversation_manager.add_message_safe(
                     conversation_id,
                     "assistant",
                     message or f"Retrieved {len(data)} datasets"
@@ -3849,7 +3909,7 @@ class QueryService:
         Returns:
             QueryResponse with results
         """
-        from backend.agents import get_agent_graph, create_initial_state
+        from backend.agents import get_agent_graph, set_query_service_provider
         from backend.memory.state_manager import get_state_manager
         from backend.memory.conversation_state import EntityContext
         from langchain_core.messages import HumanMessage, AIMessage
@@ -3857,6 +3917,9 @@ class QueryService:
         logger.info("🔄 Using LangGraph agent orchestration")
 
         try:
+            # Inject query-service provider to avoid backend.main import coupling in graph nodes.
+            set_query_service_provider(lambda: self)
+
             # Get or create the agent graph
             graph = get_agent_graph()
             state_manager = get_state_manager()
@@ -4049,7 +4112,12 @@ class QueryService:
                         sorted(query_cues),
                         sorted(result_cues),
                     )
-                    return await self._standard_query_processing(query, conversation_id, tracker)
+                    return await self._standard_query_processing(
+                        query,
+                        conversation_id,
+                        tracker,
+                        record_user_message=False,
+                    )
 
             # Check for empty data (silent failure case) - LangGraph specific
             if not data or (isinstance(data, list) and len(data) == 0):
@@ -4192,11 +4260,12 @@ class QueryService:
                 response.message = query_result.get("message", "")
 
             # Add to conversation history
-            conversation_manager.add_message_safe(
+            conversation_id = conversation_manager.add_message_safe(
                 conversation_id,
                 "assistant",
                 f"Query processed: {result.get('query_type', 'data_fetch')}"
             )
+            response.conversationId = conversation_id
 
             return response
 
@@ -4204,13 +4273,19 @@ class QueryService:
             logger.exception(f"LangGraph execution error: {e}")
             # Fall back to standard processing
             logger.warning("Falling back to standard query processing")
-            return await self._standard_query_processing(query, conversation_id, tracker)
+            return await self._standard_query_processing(
+                query,
+                conversation_id,
+                tracker,
+                record_user_message=False,
+            )
 
     async def _standard_query_processing(
         self,
         query: str,
         conversation_id: str,
-        tracker: Optional['ProcessingTracker'] = None
+        tracker: Optional['ProcessingTracker'] = None,
+        record_user_message: bool = True,
     ) -> QueryResponse:
         """
         Standard query processing (without orchestrator).
@@ -4239,7 +4314,13 @@ class QueryService:
             )
             intent.apiProvider = routed_provider
 
-        conversation_manager.add_message_safe(conversation_id, "user", query, intent=intent)
+        if record_user_message:
+            conversation_id = conversation_manager.add_message_safe(
+                conversation_id,
+                "user",
+                query,
+                intent=intent,
+            )
 
         if intent.clarificationNeeded:
             return QueryResponse(
@@ -4267,7 +4348,7 @@ class QueryService:
         if clarification_response:
             return clarification_response
 
-        conversation_manager.add_message_safe(
+        conversation_id = conversation_manager.add_message_safe(
             conversation_id,
             "assistant",
             f"Retrieved {len(data)} data series from {intent.apiProvider}",
@@ -4317,7 +4398,11 @@ class QueryService:
                 conversation_history = conversation_manager.get_messages(conversation_id)
 
                 # Add current query to history
-                conversation_manager.add_message_safe(conversation_id, "user", query)
+                conversation_id = conversation_manager.add_message_safe(
+                    conversation_id,
+                    "user",
+                    query,
+                )
 
                 # Create and execute LangChain agent
                 if tracker:
@@ -4340,7 +4425,7 @@ class QueryService:
                     output = result.get("output", "")
 
                     # Add to conversation history
-                    conversation_manager.add_message_safe(
+                    conversation_id = conversation_manager.add_message_safe(
                         conversation_id,
                         "assistant",
                         f"LangChain Pro Mode: {output[:200]}..."
@@ -4468,7 +4553,11 @@ class QueryService:
                         "note": "These are VERIFIED vector IDs that work with Vector API (getDataFromVectorsAndLatestNPeriods). For categorical breakdowns, Pro Mode will discover appropriate dimensions."
                     }
 
-                conversation_manager.add_message_safe(conversation_id, "user", query)
+                conversation_id = conversation_manager.add_message_safe(
+                    conversation_id,
+                    "user",
+                    query,
+                )
 
                 logger.info(
                     "🤖 Generating code with Grok (auto-switched, conversation: %s, history: %d, session data: %s)...",
@@ -4540,7 +4629,7 @@ class QueryService:
                 else:
                     response_message = "✅ **Auto-switched to Pro Mode**\n\nCode executed successfully."
 
-                conversation_manager.add_message_safe(
+                conversation_id = conversation_manager.add_message_safe(
                     conversation_id,
                     "assistant",
                     f"Auto-switched to Pro Mode. Generated and executed code. Output: {execution_result.output[:200]}"

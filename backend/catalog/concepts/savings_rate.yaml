@@ -1,0 +1,47 @@
+# Savings Rate Indicator Catalog
+concept: savings_rate
+category: national_accounts
+domain: macroeconomics
+
+description: |
+  Savings rate captures national savings relative to the size of the economy,
+  commonly expressed as gross national savings as a percentage of GDP.
+
+synonyms:
+  primary:
+    - gross national savings share of gdp
+    - gross national savings as percent of gdp
+    - savings to gdp ratio
+    - national savings rate
+  secondary:
+    - gross savings share of gdp
+    - savings share of gdp
+    - aggregate savings ratio
+
+explicit_exclusions:
+  - household savings account
+  - gross domestic savings
+  - personal savings rate
+  - savings deposits
+
+providers:
+  WorldBank:
+    primary:
+      code: NY.GNS.ICTR.ZS
+      name: "Gross savings (% of GDP)"
+      confidence: 0.95
+      coverage: global
+      frequency: annual
+
+  IMF:
+    primary:
+      code: NGS_FY_GDP_PT
+      name: "Gross national savings, percent of GDP"
+      confidence: 0.90
+      coverage: global
+      frequency: annual
+
+not_available:
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate

@@ -28,7 +28,12 @@ from .orchestrator import AgentOrchestrator
 
 # LangGraph components
 from .langgraph_state import AgentState, create_initial_state, LangGraphProcessingStep
-from .langgraph_graph import get_agent_graph, create_agent_graph, reset_agent_graph
+from .langgraph_graph import (
+    get_agent_graph,
+    create_agent_graph,
+    reset_agent_graph,
+    set_query_service_provider,
+)
 
 # Shared utilities
 from .utils import (
@@ -55,6 +60,7 @@ __all__ = [
     "get_agent_graph",
     "create_agent_graph",
     "reset_agent_graph",
+    "set_query_service_provider",
     # Utilities
     "create_data_reference",
     "create_data_reference_from_response",

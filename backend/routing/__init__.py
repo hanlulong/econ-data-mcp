@@ -15,11 +15,13 @@ Components:
 
 from .country_resolver import CountryResolver
 from .keyword_matcher import KeywordMatcher
+from .semantic_provider_router import SemanticProviderRouter
 from .unified_router import UnifiedRouter, RoutingDecision
 
 __all__ = [
     "CountryResolver",
     "KeywordMatcher",
+    "SemanticProviderRouter",
     "UnifiedRouter",
     "RoutingDecision",
 ]

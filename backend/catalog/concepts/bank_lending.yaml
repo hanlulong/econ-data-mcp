@@ -1,0 +1,57 @@
+# Bank Lending Indicator Catalog
+concept: bank_lending
+category: credit
+domain: finance
+
+description: |
+  Bank lending tracks credit extended by banks to households and firms.
+  Queries often ask for lending levels, growth, or credit expansion.
+
+synonyms:
+  primary:
+    - bank lending
+    - bank lending growth
+    - bank credit
+    - bank credit growth
+    - commercial bank credit
+  secondary:
+    - lending to private sector
+    - private credit by banks
+    - domestic credit by banks
+    - credit growth
+
+explicit_exclusions:
+  - policy rate
+  - bond yields
+  - deposits
+  - trade credit
+
+providers:
+  FRED:
+    primary:
+      code: TOTBKCR
+      name: "Commercial Bank Credit, All Commercial Banks"
+      confidence: 0.95
+      coverage: [US]
+      frequency: weekly
+
+  BIS:
+    primary:
+      code: WS_TC
+      name: "Total credit to private non-financial sector"
+      confidence: 0.90
+      coverage: global
+      frequency: quarterly
+
+  WorldBank:
+    primary:
+      code: FS.AST.PRVT.GD.ZS
+      name: "Domestic credit to private sector by banks (% of GDP)"
+      confidence: 0.88
+      coverage: global
+      frequency: annual
+
+not_available:
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate

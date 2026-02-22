@@ -21,6 +21,8 @@ explicit_exclusions:
   - interest rate
   - inflation rate
   - exchange traded
+  - real effective exchange rate
+  - reer
 
 providers:
   ExchangeRate:

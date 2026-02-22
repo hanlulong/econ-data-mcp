@@ -96,6 +96,13 @@ class CacheService:
             self.hits += 1
             return entry.value
 
+    def delete(self, key: str) -> bool:
+        """Delete a raw cache key. Returns True when key existed."""
+        with self._lock:
+            existed = key in self._cache
+            self._cache.pop(key, None)
+            return existed
+
     def _maybe_cleanup(self) -> None:
         """Cleanup expired entries if interval elapsed (must hold lock)."""
         now = time.time()
@@ -161,6 +168,9 @@ class CacheService:
                 "max_entries": self.MAX_CACHE_ENTRIES,
             }
 
+    def stats(self) -> Dict[str, int | float]:
+        """Backward-compatible alias used by RedisCacheService."""
+        return self.get_stats()
+
 
 cache_service = CacheService()
-

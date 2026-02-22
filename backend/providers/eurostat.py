@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Dict, Optional, TYPE_CHECKING, Any
 
@@ -491,14 +492,20 @@ class EurostatProvider(BaseProvider):
         if mapped:
             return mapped, self._dataset_labels.get(mapped)
 
-        # Step 2: Allow users to supply raw Eurostat dataset codes directly (lowercase with underscores)
-        if indicator and indicator.lower() == indicator and "_" in indicator:
-            return indicator, self._dataset_labels.get(indicator)
+        # Step 2: Allow users to supply raw Eurostat dataset codes directly.
+        # Accept both lowercase and uppercase inputs (e.g., "prc_hicp_aind" or "PRC_HICP_AIND").
+        if indicator and "_" in indicator:
+            normalized_indicator = indicator.strip().lower()
+            if re.fullmatch(r"[a-z0-9_]+", normalized_indicator):
+                return normalized_indicator, self._dataset_labels.get(normalized_indicator)
 
         # Step 3: Try cross-provider indicator translator (handles IMF codes like NGDP, LUR, etc.)
         translator = get_indicator_translator()
         translated_code, concept_name = translator.translate_indicator(indicator, "EUROSTAT")
         if translated_code:
+            translated_code = str(translated_code).strip()
+            if re.fullmatch(r"[A-Za-z0-9_]+", translated_code):
+                translated_code = translated_code.lower()
             logger.info(f"Eurostat: Translated '{indicator}' to '{translated_code}' via concept '{concept_name}'")
             return translated_code, concept_name
 

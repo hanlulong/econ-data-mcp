@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import logging
 import asyncio
 
@@ -10,7 +10,7 @@ import httpx
 
 from ..config import get_settings
 from ..services.http_pool import get_http_client
-from ..models import Metadata, NormalizedData
+from ..models import DataPoint, Metadata, NormalizedData
 from .comtrade_metadata import (
     COUNTRY_CODE_MAPPINGS,
     HS_CODE_MAPPINGS,
@@ -276,6 +276,10 @@ class ComtradeProvider(BaseProvider):
         - "EU27_2020" returns list of individual EU member countries
         - Taiwan can use code 158 (standard) or 490 (alternative for some contexts)
         """
+        # Already a UN numeric country code
+        if country and str(country).isdigit():
+            return str(country)
+
         key = country.upper().replace(" ", "_")
         code = COUNTRY_CODE_MAPPINGS.get(key, None)
 
@@ -294,8 +298,8 @@ class ComtradeProvider(BaseProvider):
         return ComtradeProvider.FLOW_MAPPINGS.get(key, "M,X")
 
     @staticmethod
-    def _generate_periods(start_year: int, end_year: int, frequency: str) -> str:
-        """Generate period parameter based on frequency.
+    def _generate_period_values(start_year: int, end_year: int, frequency: str) -> List[str]:
+        """Generate period values based on frequency.
 
         Args:
             start_year: Start year
@@ -303,31 +307,111 @@ class ComtradeProvider(BaseProvider):
             frequency: "annual", "monthly", "quarterly"
 
         Returns:
-            Comma-separated period string (e.g., "2015,2016,2017" for annual)
+            List of period strings (e.g., ["2015", "2016", ...] for annual)
         """
         if frequency.lower() in ["annual", "yearly", "a", "y"]:
-            # Annual: "2015,2016,2017,..."
-            return ",".join(str(year) for year in range(start_year, end_year + 1))
+            return [str(year) for year in range(start_year, end_year + 1)]
 
         elif frequency.lower() in ["monthly", "month", "m"]:
-            # Monthly: "202001,202002,...,202012,202101,..."
             periods = []
             for year in range(start_year, end_year + 1):
                 for month in range(1, 13):
                     periods.append(f"{year}{month:02d}")
-            return ",".join(periods)
+            return periods
 
         elif frequency.lower() in ["quarterly", "quarter", "q"]:
-            # Quarterly: "20201,20202,20203,20204,20211,..." (YYYYQ format)
             periods = []
             for year in range(start_year, end_year + 1):
                 for quarter in range(1, 5):
                     periods.append(f"{year}{quarter}")
-            return ",".join(periods)
+            return periods
 
         else:
-            # Default to annual
-            return ",".join(str(year) for year in range(start_year, end_year + 1))
+            return [str(year) for year in range(start_year, end_year + 1)]
+
+    @staticmethod
+    def _chunk_period_values(period_values: List[str], max_periods: int = 12) -> List[str]:
+        """Chunk period values into API-safe comma-separated batches.
+
+        UN Comtrade returns HTTP 400 when the request includes too many periods.
+        Keep chunking centralized so all query shapes use the same guardrail.
+        """
+        if not period_values:
+            return []
+        size = max(1, int(max_periods))
+        return [
+            ",".join(period_values[i:i + size])
+            for i in range(0, len(period_values), size)
+        ]
+
+    @staticmethod
+    def _merge_series_segments(series_list: List[NormalizedData]) -> List[NormalizedData]:
+        """Merge segmented Comtrade responses into one series per flow/country."""
+        if not series_list:
+            return []
+
+        merged: Dict[Tuple[str, str, str, str, str], NormalizedData] = {}
+        for series in series_list:
+            if not series or not series.metadata:
+                continue
+
+            meta = series.metadata
+            key = (
+                str(meta.source or ""),
+                str(meta.indicator or ""),
+                str(meta.country or ""),
+                str(meta.frequency or ""),
+                str(meta.unit or ""),
+            )
+
+            if key not in merged:
+                merged[key] = NormalizedData(
+                    metadata=meta.model_copy(deep=True),
+                    data=list(series.data or []),
+                )
+                continue
+
+            existing = merged[key]
+            existing.data.extend(series.data or [])
+            if not existing.metadata.apiUrl and meta.apiUrl:
+                existing.metadata.apiUrl = meta.apiUrl
+            if not existing.metadata.sourceUrl and meta.sourceUrl:
+                existing.metadata.sourceUrl = meta.sourceUrl
+
+        # Deduplicate points by date and keep sorted chronology.
+        for series in merged.values():
+            dedup: Dict[str, Dict[str, Optional[float]]] = {}
+            for point in series.data or []:
+                if isinstance(point, dict):
+                    date = point.get("date")
+                    value = point.get("value")
+                else:
+                    date = getattr(point, "date", None)
+                    value = getattr(point, "value", None)
+
+                if not date:
+                    continue
+                date_str = str(date)
+                existing = dedup.get(date_str)
+                if existing is None:
+                    dedup[date_str] = {"date": date_str, "value": value}
+                    continue
+                existing_value = existing.get("value")
+                if existing_value is None and value is not None:
+                    dedup[date_str] = {"date": date_str, "value": value}
+                elif value is not None and existing_value is not None and value > existing_value:
+                    dedup[date_str] = {"date": date_str, "value": value}
+
+            ordered = sorted(dedup.values(), key=lambda x: x["date"])
+            series.data = [
+                DataPoint(date=item["date"], value=item.get("value"))
+                for item in ordered
+            ]
+            if series.data:
+                series.metadata.startDate = series.data[0].date
+                series.metadata.endDate = series.data[-1].date
+
+        return list(merged.values())
 
     async def _fetch_single_reporter_data(
         self,
@@ -584,7 +668,7 @@ class ComtradeProvider(BaseProvider):
         self,
         reporter: Optional[str] = None,
         reporters: Optional[List[str]] = None,
-        partner: Optional[str] = None,
+        partner: Optional[str | List[str]] = None,
         commodity: Optional[str] = None,
         flow: Optional[str] = None,
         start_year: Optional[int] = None,
@@ -647,6 +731,12 @@ class ComtradeProvider(BaseProvider):
                 expanded_reporters.append(r)
         reporter_list = expanded_reporters if expanded_reporters else reporter_list
 
+        partner_inputs: List[str] = []
+        if isinstance(partner, list):
+            partner_inputs = [str(p) for p in partner if p]
+        elif partner:
+            partner_inputs = [str(partner)]
+
         # Taiwan Special Handling: Taiwan (490) is a non-reporting territory
         # If Taiwan is the reporter, we need to flip to partner perspective
         # Taiwan exports = partner imports FROM Taiwan (490)
@@ -663,7 +753,7 @@ class ComtradeProvider(BaseProvider):
                 )
 
                 # If no partner specified, use major Taiwan trading partners
-                if not partner:
+                if not partner_inputs:
                     # Major Taiwan trading partners: China, USA, Japan, South Korea, Hong Kong
                     logger.info(
                         "No partner specified for Taiwan query - querying major trading partners: "
@@ -672,7 +762,7 @@ class ComtradeProvider(BaseProvider):
                     partner_list_for_taiwan = ["China", "USA", "Japan", "South Korea", "Hong Kong", "Singapore"]
                     # Flip: Taiwan as reporter → partners as reporters, Taiwan (490) as partner
                     reporter_list = partner_list_for_taiwan
-                    partner = "Taiwan"  # Will resolve to 490
+                    partner_inputs = ["Taiwan"]  # Will resolve to 490
                     # Flip flow direction
                     if flow:
                         flow_upper = flow.upper()
@@ -683,9 +773,10 @@ class ComtradeProvider(BaseProvider):
                             flow = "EXPORT"  # Taiwan imports = partner exports to Taiwan
                             logger.info("Flipped flow: Taiwan imports → partner exports TO Taiwan")
                 else:
-                    # Partner specified - flip reporter and partner
-                    original_partner = partner
-                    partner = "Taiwan"  # Taiwan becomes partner (490)
+                    # Partner specified - flip reporter and partner.
+                    # For multi-partner inputs, use the first partner for this transformation.
+                    original_partner = partner_inputs[0]
+                    partner_inputs = ["Taiwan"]  # Taiwan becomes partner (490)
                     reporter_list = [original_partner]  # Partner becomes reporter
                     # Flip flow direction
                     if flow:
@@ -697,33 +788,84 @@ class ComtradeProvider(BaseProvider):
                             flow = "EXPORT"
                             logger.info(f"Flipped: Taiwan imports from {original_partner} → {original_partner} exports TO Taiwan")
 
-        # Handle partner country code resolution
-        if partner:
-            partner_code = self._country_code(partner)
+        # Handle partner country code resolution (supports lists and region expansion)
+        partner_codes: List[str] = []
+        if partner_inputs:
+            for partner_item in partner_inputs:
+                partner_raw = str(partner_item).strip()
+                if not partner_raw:
+                    continue
 
-            # Special handling for EU27_2020 - query individual EU countries
-            if partner_code == "EU27_2020":
-                logger.info(
-                    f"Expanding EU partner query to {len(EU27_COUNTRY_CODES)} individual EU member countries"
+                partner_upper = partner_raw.upper().replace(" ", "_").replace("-", "_")
+
+                # First, try CountryResolver region expansion.
+                expanded_partners = CountryResolver.get_region_expansion(
+                    partner_upper,
+                    format="un_numeric",
                 )
-                # For UK imports from EU, query UK as reporter with each EU country as partner
-                # This will be handled by making multiple parallel requests below
-                # For now, we'll use a special marker that we process later
-                partner_is_eu27 = True
-                partner_code = None  # Will expand later
-            elif partner_code is None:
-                # Partner is an unrecognized region that cannot be resolved
+                if expanded_partners:
+                    resolved_codes = [str(code) for code in expanded_partners]
+                    logger.info(
+                        "🌍 Expanding Comtrade partner region '%s' via CountryResolver → %d countries",
+                        partner_raw,
+                        len(resolved_codes),
+                    )
+                    partner_codes.extend(resolved_codes)
+                    continue
+
+                # Try common region variants.
+                if "_COUNTRIES" in partner_upper or "_NATIONS" in partner_upper:
+                    variant = partner_upper.replace("_COUNTRIES", "").replace("_NATIONS", "")
+                    expanded_partners = CountryResolver.get_region_expansion(variant, format="un_numeric")
+                    if expanded_partners:
+                        resolved_codes = [str(code) for code in expanded_partners]
+                        logger.info(
+                            "🌍 Matched Comtrade partner region '%s' via CountryResolver → %d countries",
+                            variant,
+                            len(resolved_codes),
+                        )
+                        partner_codes.extend(resolved_codes)
+                        continue
+
+                # Fall back to Comtrade region mappings.
+                if partner_upper in REGION_EXPANSIONS:
+                    resolved_codes = [str(code) for code in REGION_EXPANSIONS[partner_upper]]
+                    logger.info(
+                        "🌍 Expanding Comtrade partner region '%s' via Comtrade mappings → %d countries",
+                        partner_raw,
+                        len(resolved_codes),
+                    )
+                    partner_codes.extend(resolved_codes)
+                    continue
+
+                partner_code = self._country_code(partner_raw)
+                if partner_code is None:
+                    raise DataNotAvailableError(
+                        f"'{partner_raw}' is not a valid country or recognized region in UN Comtrade. "
+                        f"Please specify individual countries. "
+                        f"For regions like 'Middle East', please specify individual countries: "
+                        f"UAE, Saudi Arabia, Qatar, Kuwait, Oman, Iraq, Iran, Israel, etc."
+                    )
+
+                if partner_code == "EU27_2020":
+                    logger.info(
+                        "Expanding EU partner query to %d individual EU member countries",
+                        len(EU27_COUNTRY_CODES),
+                    )
+                    partner_codes.extend(EU27_COUNTRY_CODES)
+                else:
+                    partner_codes.append(partner_code)
+
+            if not partner_codes:
                 raise DataNotAvailableError(
-                    f"'{partner}' is not a valid country or recognized region in UN Comtrade. "
-                    f"Please specify individual countries. "
-                    f"For regions like 'Middle East', please specify individual countries: "
-                    f"UAE, Saudi Arabia, Qatar, Kuwait, Oman, Iraq, Iran, Israel, etc."
+                    "No valid partner countries were resolved for the query."
                 )
-            else:
-                partner_is_eu27 = False
         else:
-            partner_code = "0"  # World total
-            partner_is_eu27 = False
+            partner_codes = ["0"]  # World total
+
+        # Preserve order while removing duplicates.
+        partner_codes = list(dict.fromkeys(partner_codes))
+
         commodity_code = self._commodity_code(commodity)
         flow_code = self._flow_code(flow)
 
@@ -740,48 +882,53 @@ class ComtradeProvider(BaseProvider):
         else:
             freq_code = "A"  # Annual is default
 
-        # Generate period parameter based on frequency
-        period_param = self._generate_periods(start, end, frequency)
+        # Guardrail: Comtrade often lags by ~1 year (or more for annual data).
+        # Avoid invalid future periods that trigger HTTP 400 and fallback misrouting.
+        if freq_code == "A":
+            max_supported_year = now.year - 2
+        elif freq_code == "Q":
+            max_supported_year = now.year - 1
+        else:
+            max_supported_year = now.year
+
+        if end > max_supported_year:
+            logger.info(
+                "Clamping Comtrade end year from %s to %s for %s frequency",
+                end,
+                max_supported_year,
+                frequency,
+            )
+            end = max_supported_year
+
+        if start > end:
+            logger.info(
+                "Adjusting Comtrade start year from %s to %s to keep a valid period range",
+                start,
+                end,
+            )
+            start = end
+
+        # Generate and chunk period parameters.
+        # API guardrail: UN Comtrade returns 400 when request period count is too large.
+        period_values = self._generate_period_values(start, end, frequency)
+        period_chunks = self._chunk_period_values(period_values, max_periods=12)
+        if not period_chunks:
+            return []
 
         # Use shared HTTP client pool for better performance (timeout passed per-request)
         client = get_http_client()
-        # If partner is EU27, expand to individual EU countries
-        if partner_is_eu27:
-            logger.info(
-                f"Querying {len(reporter_list)} reporter(s) against {len(EU27_COUNTRY_CODES)} EU countries"
-            )
-            # Create tasks for each reporter x each EU country combination
-            tasks = []
-            for reporter_raw in reporter_list:
-                for eu_country_code in EU27_COUNTRY_CODES:
-                    tasks.append(
-                        self._fetch_single_reporter_data(
-                            client,
-                            reporter_raw,
-                            eu_country_code,
-                            commodity_code,
-                            flow_code,
-                            period_param,
-                            freq_code,
-                        )
-                    )
+        # Fetch combinations with bounded concurrency to reduce 429 bursts.
+        # Comtrade applies aggressive short-window rate limits.
+        max_concurrent_requests = 1 if freq_code == "A" else 2
+        semaphore = asyncio.Semaphore(max_concurrent_requests)
 
-            # Wait for all EU country requests to complete
-            results_list = await asyncio.gather(*tasks)
-
-            # Flatten and aggregate results
-            all_results = []
-            for result in results_list:
-                all_results.extend(result)
-
-            # TODO: Consider aggregating data across EU countries for cleaner output
-            # For now, return all individual country results
-            logger.info(f"Retrieved {len(all_results)} data series from EU countries")
-
-        else:
-            # Standard query - fetch data for all reporters in parallel
-            tasks = [
-                self._fetch_single_reporter_data(
+        async def _guarded_fetch(
+            reporter_raw: str,
+            partner_code: str,
+            period_param: str,
+        ) -> List[NormalizedData]:
+            async with semaphore:
+                return await self._fetch_single_reporter_data(
                     client,
                     reporter_raw,
                     partner_code,
@@ -790,18 +937,23 @@ class ComtradeProvider(BaseProvider):
                     period_param,
                     freq_code,
                 )
-                for reporter_raw in reporter_list
-            ]
 
-            # Wait for all requests to complete
-            results_list = await asyncio.gather(*tasks)
+        tasks = [
+            _guarded_fetch(reporter_raw, partner_code, period_param)
+            for reporter_raw in reporter_list
+            for partner_code in partner_codes
+            for period_param in period_chunks
+        ]
 
-            # Flatten results (each task returns a list)
-            all_results = []
-            for result in results_list:
-                all_results.extend(result)
+        # Wait for all requests to complete
+        results_list = await asyncio.gather(*tasks)
 
-        return all_results
+        # Flatten results (each task returns a list)
+        all_results = []
+        for result in results_list:
+            all_results.extend(result)
+
+        return self._merge_series_segments(all_results)
 
     async def fetch_trade_balance(
         self,

@@ -1,0 +1,54 @@
+# Real Effective Exchange Rate (REER) Catalog
+concept: real_effective_exchange_rate
+category: currency
+domain: finance
+
+description: |
+  Real effective exchange rate (REER) is a trade-weighted index of a currency
+  adjusted for relative price levels.
+
+synonyms:
+  primary:
+    - real effective exchange rate
+    - reer
+    - effective exchange rate real
+  secondary:
+    - real broad effective exchange rate
+    - trade weighted real exchange rate
+    - real effective fx index
+
+explicit_exclusions:
+  - nominal effective exchange rate
+  - bilateral exchange rate
+  - currency conversion
+  - spot exchange rate
+
+providers:
+  BIS:
+    primary:
+      code: WS_XRU
+      name: "Effective exchange rate indices"
+      confidence: 0.92
+      coverage: global
+      frequency: monthly
+
+  IMF:
+    primary:
+      code: REAL_EFFECTIVE_EXCHANGE_RATE
+      name: "Real Effective Exchange Rate"
+      confidence: 0.80
+      coverage: partial_global
+      frequency: annual
+
+  OECD:
+    primary:
+      code: REER
+      name: "Real effective exchange rates"
+      confidence: 0.75
+      coverage: oecd_members
+      frequency: monthly
+
+not_available:
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate

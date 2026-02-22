@@ -1,0 +1,55 @@
+# Producer Price Inflation Indicator Catalog
+concept: producer_price_inflation
+category: prices
+domain: macroeconomics
+
+description: |
+  Producer price inflation measures changes in prices received by domestic producers.
+  It is commonly referred to as PPI inflation.
+
+synonyms:
+  primary:
+    - producer price inflation
+    - ppi inflation
+    - producer prices
+    - producer price index inflation
+  secondary:
+    - wholesale inflation
+    - wholesale price inflation
+    - ppi
+
+explicit_exclusions:
+  - consumer price inflation
+  - cpi inflation
+  - gdp deflator
+  - import prices
+
+providers:
+  FRED:
+    primary:
+      code: PPIACO
+      name: "Producer Price Index by Commodity: All Commodities"
+      confidence: 0.95
+      coverage: [US]
+      frequency: monthly
+
+  WorldBank:
+    primary:
+      code: FP.WPI.TOTL.ZG
+      name: "Inflation, wholesale prices (annual %)"
+      confidence: 0.88
+      coverage: global
+      frequency: annual
+
+  OECD:
+    primary:
+      code: PPI
+      name: "Producer Price Index"
+      confidence: 0.80
+      coverage: oecd_members
+      frequency: monthly
+
+not_available:
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate

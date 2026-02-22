@@ -476,11 +476,11 @@ class FAISSVectorSearch:
 
             # Convert to results
             results = []
-            for idx in indices[0]:
+            for raw_rank, idx in enumerate(indices[0]):
                 if idx < 0 or idx >= len(self.metadata_list):
                     continue
 
-                distance = float(distances[0][len(results)])
+                distance = float(distances[0][raw_rank])
                 metadata = self.metadata_list[idx]
 
                 # Apply provider filter if specified

@@ -223,10 +223,15 @@ class DataAgent:
         params = {
             "provider": base_dataset.provider,
             "indicator": base_dataset.indicator,
-            "country": base_dataset.country,
             "startDate": base_dataset.time_range[0] if base_dataset.time_range else None,
             "endDate": base_dataset.time_range[1] if base_dataset.time_range else None,
         }
+
+        # Preserve multi-country context when present.
+        if base_dataset.countries:
+            params["countries"] = list(base_dataset.countries)
+        elif base_dataset.country:
+            params["country"] = base_dataset.country
 
         # Apply frequency change
         if context.get("frequency"):
@@ -278,17 +283,13 @@ class DataAgent:
             history = []  # No history available here
             intent = await self.openrouter_service.parse_query(query, history)
 
-        # CRITICAL FIX: Apply ProviderRouter routing to ensure keyword-based routing works
-        # This ensures exchange rate queries go to ExchangeRate-API, trade queries to Comtrade, etc.
-        # Without this, the LLM's provider selection is used directly, which often defaults to FRED/WorldBank
-        from ..services.provider_router import ProviderRouter
-
-        routed_provider = ProviderRouter.route_provider(intent, query)
-
-        # Also apply CoinGecko misrouting correction (prevents fiscal queries going to CoinGecko)
-        routed_provider = ProviderRouter.correct_coingecko_misrouting(
-            routed_provider, query, intent.indicators
-        )
+        # Keep LangGraph data node aligned with the main query pipeline:
+        # apply country overrides and hybrid provider routing (if enabled).
+        self.query_service._apply_country_overrides(intent, query)
+        if explicit_provider:
+            routed_provider = explicit_provider
+        else:
+            routed_provider = await self.query_service._select_routed_provider(intent, query)
 
         if routed_provider != intent.apiProvider:
             logger.info(f"🔄 DataAgent: Provider routing override: {intent.apiProvider} → {routed_provider}")
@@ -352,6 +353,15 @@ class DataAgent:
 
         first = data[0]
         metadata = first.metadata
+        countries = []
+        for series in data:
+            if (
+                series
+                and getattr(series, "metadata", None)
+                and series.metadata.country
+                and series.metadata.country not in countries
+            ):
+                countries.append(series.metadata.country)
 
         return DataReference(
             id=str(uuid.uuid4()),
@@ -359,7 +369,8 @@ class DataAgent:
             provider=metadata.source or "UNKNOWN",
             dataset_code=metadata.seriesId,
             indicator=metadata.indicator or "",
-            country=metadata.country,
+            country=metadata.country or (countries[0] if countries else None),
+            countries=countries,
             time_range=(metadata.startDate, metadata.endDate) if metadata.startDate else None,
             unit=metadata.unit or "",
             frequency=metadata.frequency or "",

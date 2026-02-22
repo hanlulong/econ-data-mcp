@@ -46,6 +46,7 @@ from fastapi.security import HTTPBearer
 
 from .services.mock_auth import MockAuthService
 from .services.cache import cache_service
+from .services.redis_cache import get_redis_cache
 from .services.conversation import conversation_manager
 from .services.export import export_service
 from .services.feedback import feedback_service
@@ -1503,8 +1504,14 @@ async def cache_stats(user: User = Depends(get_required_user)):
 async def cache_clear(user: User = Depends(get_required_user)):
     """Clear the cache. Requires authentication."""
     logger.info(f"Cache cleared by user: {user.email}")
+    redis_deleted = 0
+    try:
+        redis_cache = await get_redis_cache()
+        redis_deleted = await redis_cache.clear_all()
+    except Exception as exc:
+        logger.warning(f"Redis cache clear failed, continuing with in-memory clear: {exc}")
     cache_service.clear()
-    return {"message": "Cache cleared"}
+    return {"message": "Cache cleared", "redisDeleted": redis_deleted}
 
 
 @app.get("/api/performance/metrics")

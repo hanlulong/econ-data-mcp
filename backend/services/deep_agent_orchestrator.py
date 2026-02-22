@@ -601,7 +601,7 @@ class DeepAgentOrchestrator:
         conversation_id: Optional[str],
     ) -> Dict[str, Any]:
         """Execute parallel data fetching for comparison queries with smart routing."""
-        tasks = []
+        jobs = []
         task_count = 0
 
         # Create fetch tasks for each indicator/country combination
@@ -636,12 +636,7 @@ class DeepAgentOrchestrator:
                     if indicator in todo["content"].lower() and country in todo["content"].lower():
                         todo["status"] = "in_progress"
 
-                # Create async task with provider hint
-                task = asyncio.create_task(
-                    self._fetch_single_with_retry(indicator, country, provider, task_id)
-                )
-                tasks.append({
-                    "task": task,
+                jobs.append({
                     "task_id": task_id,
                     "indicator": indicator,
                     "country": country,
@@ -650,42 +645,47 @@ class DeepAgentOrchestrator:
 
         self.progress_tracker.update(
             "parallel_setup", TaskStatus.COMPLETED,
-            f"Created {len(tasks)} fetch tasks", 50
+            f"Created {len(jobs)} fetch tasks", 50
         )
 
         # Execute with concurrency limit
         semaphore = asyncio.Semaphore(self.config.max_concurrent_subagents)
         completed_count = 0
 
-        async def fetch_with_limit(task_info):
+        async def fetch_with_limit(job):
             nonlocal completed_count
             async with semaphore:
                 self.progress_tracker.update(
-                    task_info["task_id"], TaskStatus.IN_PROGRESS,
-                    f"Fetching {task_info['indicator']} for {task_info['country']}...",
-                    50 + (completed_count / len(tasks)) * 40
+                    job["task_id"], TaskStatus.IN_PROGRESS,
+                    f"Fetching {job['indicator']} for {job['country']}...",
+                    50 + (completed_count / len(jobs)) * 40
                 )
 
-                result = await task_info["task"]
+                result = await self._fetch_single_with_retry(
+                    job["indicator"],
+                    job["country"],
+                    job["provider"],
+                    job["task_id"],
+                )
                 completed_count += 1
 
                 status = TaskStatus.COMPLETED if result.get("success") else TaskStatus.FAILED
                 self.progress_tracker.update(
-                    task_info["task_id"], status,
-                    f"{'✓' if result.get('success') else '✗'} {task_info['indicator']}/{task_info['country']}",
-                    50 + (completed_count / len(tasks)) * 40
+                    job["task_id"], status,
+                    f"{'✓' if result.get('success') else '✗'} {job['indicator']}/{job['country']}",
+                    50 + (completed_count / len(jobs)) * 40
                 )
 
                 return {
-                    "indicator": task_info["indicator"],
-                    "country": task_info["country"],
-                    "provider": task_info["provider"],
+                    "indicator": job["indicator"],
+                    "country": job["country"],
+                    "provider": job["provider"],
                     "result": result,
                 }
 
         # Wait for all fetches
         completed = await asyncio.gather(
-            *[fetch_with_limit(t) for t in tasks],
+            *[fetch_with_limit(job) for job in jobs],
             return_exceptions=True
         )
 
@@ -831,7 +831,13 @@ class DeepAgentOrchestrator:
             # Use existing query service
             if not query:
                 query = f"{indicator} for {country}"
-            result = await self.query_service.process_query(query)
+            # Prevent recursive orchestration for sub-tasks; use deterministic query flow.
+            result = await self.query_service.process_query(
+                query,
+                auto_pro_mode=False,
+                use_orchestrator=False,
+                allow_orchestrator=False,
+            )
 
             return {
                 "success": result.data is not None and len(result.data) > 0,

@@ -48,8 +48,8 @@ logger = logging.getLogger(__name__)
 # Use the global singleton from state_manager module
 def get_state_manager() -> ConversationStateManager:
     """Get the global state manager singleton from the memory module."""
-    from ..memory.state_manager import conversation_state_manager
-    return conversation_state_manager
+    from ..memory.state_manager import get_state_manager as _get_state_manager
+    return _get_state_manager()
 
 def filter_data_by_date_range(
     data: List[NormalizedData],

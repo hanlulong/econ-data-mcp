@@ -1,0 +1,47 @@
+# Trade Openness Indicator Catalog
+concept: trade_openness
+category: international_trade
+domain: macroeconomics
+
+description: |
+  Trade openness is typically measured as total trade
+  (exports plus imports of goods and services) as a share of GDP.
+
+synonyms:
+  primary:
+    - trade openness ratio
+    - trade openness
+    - trade to gdp ratio
+    - exports plus imports to gdp
+  secondary:
+    - trade as percent of gdp
+    - trade share of gdp
+    - open economy ratio
+
+explicit_exclusions:
+  - trade facilitation index
+  - openness subscore
+  - tariff openness
+  - investment openness
+
+providers:
+  WorldBank:
+    primary:
+      code: NE.TRD.GNFS.ZS
+      name: "Trade (% of GDP)"
+      confidence: 0.95
+      coverage: global
+      frequency: annual
+
+  IMF:
+    primary:
+      code: BFA_BOP_B_XS_GDP_PT
+      name: "Exports plus Imports, percent of GDP"
+      confidence: 0.80
+      coverage: global
+      frequency: annual
+
+not_available:
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate

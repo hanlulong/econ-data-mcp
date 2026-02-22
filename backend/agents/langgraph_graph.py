@@ -6,7 +6,7 @@ It coordinates the RouterAgent, DataAgent, ResearchAgent, ComparisonAgent,
 and Pro Mode execution with persistent state across conversation turns.
 """
 import logging
-from typing import Optional, Literal, Dict, Any
+from typing import Optional, Literal, Dict, Any, Callable
 import uuid
 
 from langgraph.graph import StateGraph, START, END
@@ -23,6 +23,14 @@ from backend.memory.conversation_state import (
 )
 
 logger = logging.getLogger(__name__)
+
+_query_service_provider: Optional[Callable[[], Any]] = None
+
+
+def set_query_service_provider(provider: Optional[Callable[[], Any]]) -> None:
+    """Set provider function used by data_node to access QueryService without app-level imports."""
+    global _query_service_provider
+    _query_service_provider = provider
 
 
 # ============================================================================
@@ -169,7 +177,6 @@ async def data_node(state: AgentState) -> Dict[str, Any]:
     Handles standard data fetch requests and stores DataReferences for follow-ups.
     """
     from backend.agents.data_agent import DataAgent
-    from backend.main import get_query_service
 
     logger.info("📈 Data node processing query")
 
@@ -184,8 +191,32 @@ async def data_node(state: AgentState) -> Dict[str, Any]:
         data_references=state.get("data_references", {}),
     )
 
-    # Get query service and openrouter service for DataAgent
-    query_service = get_query_service()
+    # Get query service and openrouter service for DataAgent.
+    query_service = None
+    if _query_service_provider:
+        try:
+            query_service = _query_service_provider()
+        except Exception as exc:
+            logger.warning("Query service provider failed: %s", exc)
+
+    # Legacy fallback path for app bootstraps that still rely on backend.main globals.
+    if query_service is None:
+        try:
+            from backend.main import get_query_service
+            query_service = get_query_service()
+        except Exception as exc:
+            logger.error("Unable to resolve QueryService in data_node: %s", exc)
+            step = LangGraphProcessingStep(
+                name="data_fetch",
+                status="error",
+                message="Query service unavailable",
+                metadata={"error": str(exc)},
+            )
+            return {
+                "error": "Query service unavailable",
+                "processing_steps": [step],
+            }
+
     openrouter_service = query_service.openrouter if query_service else None
 
     # Use DataAgent with required services

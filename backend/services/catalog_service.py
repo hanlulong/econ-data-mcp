@@ -105,20 +105,72 @@ def find_concept_by_term(term: str) -> Optional[str]:
     """
     catalog = load_catalog()
     term_lower = term.lower().strip()
+    if not term_lower:
+        return None
 
+    # 1) Exact match pass (strict, highest precision)
     for concept_name, concept_data in catalog.items():
-        # Check concept name
         if term_lower == concept_name.replace("_", " "):
             return concept_name
 
-        # Check synonyms
         synonyms = concept_data.get("synonyms", {})
         primary_synonyms = synonyms.get("primary", [])
         secondary_synonyms = synonyms.get("secondary", [])
-
-        all_synonyms = primary_synonyms + secondary_synonyms
-        if term_lower in [s.lower() for s in all_synonyms]:
+        all_synonyms = [s.lower() for s in (primary_synonyms + secondary_synonyms)]
+        if term_lower in all_synonyms:
             return concept_name
+
+    # 2) Semantic phrase/token pass for longer natural-language terms.
+    # Keeps precision by requiring meaningful overlap with known synonyms.
+    term_tokens = {
+        token
+        for token in term_lower.replace("_", " ").split()
+        if len(token) > 2
+    }
+    if not term_tokens:
+        return None
+
+    best_concept: Optional[str] = None
+    best_score = 0.0
+
+    for concept_name, concept_data in catalog.items():
+        if is_excluded_term(term_lower, concept_name):
+            continue
+
+        synonyms = concept_data.get("synonyms", {})
+        candidates = [concept_name.replace("_", " ")]
+        candidates.extend(synonyms.get("primary", []))
+        candidates.extend(synonyms.get("secondary", []))
+
+        concept_score = 0.0
+        for candidate in candidates:
+            candidate_lower = str(candidate or "").strip().lower()
+            if not candidate_lower:
+                continue
+
+            # Direct phrase containment is a strong signal.
+            if len(candidate_lower) >= 4 and candidate_lower in term_lower:
+                concept_score = max(concept_score, 0.95)
+                continue
+
+            candidate_tokens = {
+                token
+                for token in candidate_lower.replace("_", " ").split()
+                if len(token) > 2
+            }
+            if not candidate_tokens:
+                continue
+
+            overlap = len(term_tokens & candidate_tokens) / max(len(candidate_tokens), 1)
+            if len(candidate_tokens) >= 2 and overlap >= 0.75:
+                concept_score = max(concept_score, min(0.92, 0.60 + 0.40 * overlap))
+
+        if concept_score > best_score:
+            best_score = concept_score
+            best_concept = concept_name
+
+    if best_score >= 0.72:
+        return best_concept
 
     return None
 

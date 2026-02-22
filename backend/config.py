@@ -65,6 +65,51 @@ class Settings(BaseSettings):
         alias="USE_HYBRID_ROUTER",
         description="Enable hybrid provider routing (deterministic candidates + LLM ranking)"
     )
+    use_indicator_hybrid_rerank: bool = Field(
+        default=True,
+        alias="USE_INDICATOR_HYBRID_RERANK",
+        description="Enable hybrid indicator matching (FTS + vector RRF fusion + fuzzy scoring)"
+    )
+    indicator_rrf_k: int = Field(
+        default=60,
+        alias="INDICATOR_RRF_K",
+        description="RRF k-constant for blending lexical and semantic indicator candidate ranks"
+    )
+    indicator_vector_candidates: int = Field(
+        default=40,
+        alias="INDICATOR_VECTOR_CANDIDATES",
+        description="Number of semantic candidates to retrieve for indicator hybrid ranking"
+    )
+    use_semantic_provider_router: bool = Field(
+        default=True,
+        alias="USE_SEMANTIC_PROVIDER_ROUTER",
+        description="Enable semantic-router-based provider routing with LiteLLM fallback"
+    )
+    semantic_router_similarity_threshold: float = Field(
+        default=0.58,
+        alias="SEMANTIC_ROUTER_SIMILARITY_THRESHOLD",
+        description="Minimum semantic-router similarity required before accepting semantic route"
+    )
+    semantic_router_top_k: int = Field(
+        default=5,
+        alias="SEMANTIC_ROUTER_TOP_K",
+        description="Top-k semantic route candidates to evaluate"
+    )
+    semantic_router_encoder_model: str = Field(
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        alias="SEMANTIC_ROUTER_ENCODER_MODEL",
+        description="Embedding model name used by semantic-router encoder"
+    )
+    use_litellm_router_fallback: bool = Field(
+        default=True,
+        alias="USE_LITELLM_ROUTER_FALLBACK",
+        description="Enable LiteLLM JSON routing fallback when semantic-router confidence is low"
+    )
+    semantic_router_litellm_timeout: int = Field(
+        default=20,
+        alias="SEMANTIC_ROUTER_LITELLM_TIMEOUT",
+        description="LiteLLM routing timeout in seconds"
+    )
 
     # Pro Mode configuration - cross-platform defaults
     promode_enabled: bool = Field(
