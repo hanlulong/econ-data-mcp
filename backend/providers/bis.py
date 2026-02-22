@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, TYPE_CHECKING
 
 import httpx
@@ -273,6 +275,9 @@ class BISProvider(BaseProvider):
         "APAC": ["AU", "CN", "HK", "ID", "IN", "JP", "KR", "MY", "NZ", "PH", "SG", "TH"],
     }
 
+    # Lazy-loaded dataflow metadata (id -> {"name": ..., "description": ...})
+    _DATAFLOW_METADATA_CACHE: Optional[Dict[str, Dict[str, str]]] = None
+
     @property
     def provider_name(self) -> str:
         return "BIS"
@@ -282,6 +287,118 @@ class BISProvider(BaseProvider):
         settings = get_settings()
         self.base_url = settings.bis_base_url.rstrip("/")
         self.metadata_search = metadata_search_service
+
+    @classmethod
+    def _load_dataflow_metadata(cls) -> Dict[str, Dict[str, str]]:
+        """Load BIS SDMX dataflow labels/descriptions from local metadata cache."""
+        if cls._DATAFLOW_METADATA_CACHE is not None:
+            return cls._DATAFLOW_METADATA_CACHE
+
+        metadata: Dict[str, Dict[str, str]] = {}
+        try:
+            metadata_path = (
+                Path(__file__).resolve().parents[1]
+                / "data"
+                / "metadata"
+                / "sdmx"
+                / "bis_dataflows.json"
+            )
+            if metadata_path.exists():
+                raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+                for code, payload in raw.items():
+                    if not isinstance(payload, dict):
+                        continue
+                    metadata[str(code).upper()] = {
+                        "name": str(payload.get("name") or "").strip(),
+                        "description": str(payload.get("description") or "").strip(),
+                    }
+        except Exception as exc:
+            logger.debug("BIS: Failed to load local dataflow metadata: %s", exc)
+
+        cls._DATAFLOW_METADATA_CACHE = metadata
+        return metadata
+
+    def _lookup_dataflow_info(self, indicator_code: str) -> tuple[Optional[str], Optional[str]]:
+        """Return (name, description) for a BIS dataflow code if known."""
+        metadata = self._load_dataflow_metadata()
+        info = metadata.get(str(indicator_code or "").upper(), {})
+        name = info.get("name") or None
+        description = info.get("description") or None
+        return name, description
+
+    @staticmethod
+    def _selected_series_dimension_values(
+        series_key: Optional[str],
+        series_dimensions: list,
+    ) -> Dict[str, Dict[str, str]]:
+        """Decode selected series dimension values from a BIS series key."""
+        if not series_key or not series_dimensions:
+            return {}
+
+        try:
+            key_parts = [int(part) for part in str(series_key).split(":")]
+        except (TypeError, ValueError):
+            return {}
+
+        selected: Dict[str, Dict[str, str]] = {}
+        for idx, dim in enumerate(series_dimensions):
+            dim_id = str(dim.get("id") or "")
+            values = dim.get("values", []) or []
+            if not dim_id or idx >= len(key_parts):
+                continue
+
+            value_idx = key_parts[idx]
+            if value_idx < 0 or value_idx >= len(values):
+                continue
+
+            value_obj = values[value_idx] if isinstance(values[value_idx], dict) else {}
+            selected[dim_id] = {
+                "id": str(value_obj.get("id") or ""),
+                "name": str(value_obj.get("name") or value_obj.get("id") or "").strip(),
+            }
+        return selected
+
+    def _build_indicator_display_name(
+        self,
+        indicator_code: str,
+        indicator_label: Optional[str],
+        series_key: Optional[str],
+        series_dimensions: list,
+    ) -> str:
+        """
+        Build a user-readable indicator name for BIS series.
+
+        Falls back to local SDMX metadata labels when only opaque dataflow codes are available.
+        """
+        dataflow_name, _ = self._lookup_dataflow_info(indicator_code)
+
+        base_name = str(indicator_label or "").strip()
+        if not base_name or base_name.upper() == str(indicator_code or "").upper():
+            base_name = dataflow_name or indicator_code
+
+        selected = self._selected_series_dimension_values(series_key, series_dimensions)
+        context_parts: List[str] = []
+
+        # Add high-value context for key BIS datasets.
+        if indicator_code == "WS_TC":
+            borrower = selected.get("TC_BORROWERS", {}).get("name")
+            unit_type = selected.get("UNIT_TYPE", {}).get("name")
+            if borrower and borrower.lower() not in base_name.lower():
+                context_parts.append(borrower)
+            if unit_type and unit_type.lower() not in base_name.lower():
+                context_parts.append(unit_type)
+        elif indicator_code == "WS_DSR":
+            borrower = selected.get("DSR_BORROWERS", {}).get("name")
+            if borrower and borrower.lower() not in base_name.lower():
+                context_parts.append(borrower)
+        elif indicator_code in {"WS_SPP", "WS_CPP", "WS_DPP"}:
+            value_type = selected.get("VALUE", {}).get("name")
+            if value_type and value_type.lower() not in base_name.lower():
+                context_parts.append(value_type)
+
+        if context_parts:
+            return f"{base_name} ({'; '.join(context_parts[:2])})"
+        return base_name
 
     async def _fetch_data(self, **params) -> List[NormalizedData]:
         """Implement BaseProvider interface by routing to fetch_indicator."""
@@ -621,8 +738,14 @@ class BISProvider(BaseProvider):
                         param_str = "&".join(f"{k}={v}" for k, v in params.items())
                         api_url += f"?{param_str}"
 
-                    # Determine indicator name
-                    indicator_name = indicator_label or indicator_code
+                    # Determine indicator display name and description
+                    indicator_name = self._build_indicator_display_name(
+                        indicator_code=indicator_code,
+                        indicator_label=indicator_label,
+                        series_key=best_series_key,
+                        series_dimensions=series_dimensions,
+                    )
+                    _, dataflow_description = self._lookup_dataflow_info(indicator_code)
 
                     # Use original country code or Euro area if fallback was used
                     display_country = current_country_code
@@ -679,12 +802,13 @@ class BISProvider(BaseProvider):
                         frequency=freq_label,
                         unit=unit,
                         lastUpdated="",  # BIS doesn't provide explicit last updated date
+                        seriesId=indicator_code,
                         apiUrl=api_url,
                         sourceUrl=source_url,
                         seasonalAdjustment=seasonal_adjustment,
                         dataType=data_type,
                         priceType=price_type,
-                        description=indicator_name,
+                        description=dataflow_description or indicator_name,
                         notes=None,
                         startDate=start_date,
                         endDate=end_date,

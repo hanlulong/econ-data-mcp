@@ -150,6 +150,26 @@ class IndicatorTranslator:
                 "STATSCAN": [],
             }
         },
+        "debt_service_ratio": {
+            "aliases": [
+                "debt service ratio",
+                "debt-service ratio",
+                "dsr",
+                "debt service burden",
+                "debt servicing ratio",
+                "household debt service ratio",
+            ],
+            "imf_codes": [],
+            "providers": {
+                "FRED": [],
+                "WORLDBANK": [],
+                "IMF": [],
+                "EUROSTAT": [],
+                "OECD": [],
+                "BIS": ["WS_DSR"],
+                "STATSCAN": [],
+            }
+        },
         # INFRASTRUCTURE FIX: Consumer credit is different from household debt
         # Consumer credit = unsecured credit (credit cards, personal loans)
         # Household debt = all household liabilities (includes mortgages)

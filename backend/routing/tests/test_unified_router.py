@@ -347,6 +347,11 @@ class TestUnifiedRouter:
         decision = router.route("Government budget balance")
         assert decision.provider == "IMF"
 
+    def test_gdp_to_debt_ratio_routes_to_imf(self, router):
+        """Debt-to-GDP phrasing variants route to IMF (not BIS debt-service)."""
+        decision = router.route("GDP to debt ratio in China")
+        assert decision.provider == "IMF"
+
     # ==========================================================================
     # Development Indicator Tests
     # ==========================================================================

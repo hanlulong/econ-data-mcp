@@ -1,0 +1,47 @@
+# Debt Service Ratio Indicator Catalog
+concept: debt_service_ratio
+category: credit
+domain: finance
+
+description: |
+  Debt service burden (interest + principal payments relative to income/output),
+  commonly used in BIS private non-financial sector debt service datasets.
+
+synonyms:
+  primary:
+    - debt service ratio
+    - debt-service ratio
+    - dsr
+  secondary:
+    - debt service burden
+    - debt servicing ratio
+    - household debt service ratio
+    - private sector debt service ratio
+
+explicit_exclusions:
+  - government debt
+  - public debt
+  - sovereign debt
+  - national debt
+  - debt to gdp
+  - debt-to-gdp
+
+providers:
+  BIS:
+    primary:
+      code: WS_DSR
+      name: "Debt service ratios (Private non-financial sector)"
+      confidence: 0.96
+      coverage: 44_countries
+      frequency: quarterly
+
+not_available:
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate
+  - FRED
+  - IMF
+  - OECD
+  - Eurostat
+  - StatsCan
+  - WorldBank

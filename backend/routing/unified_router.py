@@ -67,7 +67,7 @@ class UnifiedRouter:
         "OECD": ["WorldBank", "Eurostat"],
         "EUROSTAT": ["WorldBank", "IMF"],  # NOT OECD - avoids circular chain
         "BIS": ["IMF", "WorldBank"],
-        "IMF": ["WorldBank", "OECD"],
+        "IMF": ["BIS", "WorldBank", "OECD"],
         "STATSCAN": ["WorldBank", "OECD"],
         "FRED": ["WorldBank", "OECD"],
         "COMTRADE": ["WorldBank"],
@@ -194,6 +194,17 @@ class UnifiedRouter:
                 reasoning="Trade as percentage of GDP is a development indicator from WorldBank",
             )
 
+        # 3b2: Debt-to-GDP style macro debt ratios → IMF.
+        # Avoid routing these to BIS debt-service datasets.
+        if self._is_macro_debt_ratio_query(query_lower, indicators):
+            return self._create_decision(
+                provider="IMF",
+                confidence=0.90,
+                match_type="indicator",
+                matched_pattern="debt-to-gdp ratio",
+                reasoning="Macro debt-to-GDP ratio queries are best served by IMF fiscal datasets",
+            )
+
         # 3c: US trade balance (without partner) → FRED
         if self._is_us_trade_balance_no_partner(query, country):
             return self._create_decision(
@@ -202,6 +213,16 @@ class UnifiedRouter:
                 match_type="indicator",
                 matched_pattern="US trade balance",
                 reasoning="US trade balance (without partner) uses FRED BOPGSTB series",
+            )
+
+        # 3c2: US housing construction indicators (housing starts/building permits) → FRED
+        if self._is_us_housing_construction_query(query, query_lower, indicators, country):
+            return self._create_decision(
+                provider="FRED",
+                confidence=0.90,
+                match_type="indicator",
+                matched_pattern="US housing construction",
+                reasoning="US housing starts/building permits are FRED series",
             )
 
         # 3d: IMF for forecast/projection and global macro aggregates.
@@ -429,6 +450,46 @@ class UnifiedRouter:
 
         return has_trade and has_ratio
 
+    def _is_macro_debt_ratio_query(self, query_lower: str, indicators: List[str]) -> bool:
+        """
+        Detect public/macro debt-to-GDP style requests.
+
+        Excludes BIS-specific debt contexts (debt service, household/private credit).
+        """
+        indicators_str = " ".join(indicators).lower()
+        combined = f"{query_lower} {indicators_str}"
+
+        if "debt" not in combined:
+            return False
+
+        ratio_patterns = [
+            "debt to gdp",
+            "debt-to-gdp",
+            "debt as % of gdp",
+            "debt as percentage of gdp",
+            "% of gdp debt",
+            "gdp to debt ratio",
+            "gdp/debt ratio",
+        ]
+        has_ratio = any(pattern in combined for pattern in ratio_patterns)
+        if not has_ratio:
+            return False
+
+        bis_specific_terms = [
+            "debt service",
+            "debt service ratio",
+            "household debt",
+            "private debt",
+            "private sector credit",
+            "credit to gdp",
+            "credit gap",
+            "bank credit",
+        ]
+        if any(term in combined for term in bis_specific_terms):
+            return False
+
+        return True
+
     def _is_us_trade_balance_no_partner(self, query: str, country: Optional[str]) -> bool:
         """Check if query is US trade balance without partner country."""
         query_lower = query.lower()
@@ -442,6 +503,32 @@ class UnifiedRouter:
         has_partner = self._has_bilateral_trade_partner(query)
 
         return is_us and is_trade_balance and not has_partner
+
+    def _is_us_housing_construction_query(
+        self,
+        query: str,
+        query_lower: str,
+        indicators: List[str],
+        country: Optional[str],
+    ) -> bool:
+        """Check if query asks for US housing starts/building permits."""
+        indicators_str = " ".join(indicators).lower()
+        combined = f"{query_lower} {indicators_str}"
+
+        is_us = (
+            (country and country.upper() in ["US", "USA", "UNITED STATES"])
+            or any(term in query_lower for term in ["us ", "u.s.", "united states", "america"])
+        )
+        if not is_us:
+            return False
+
+        return any(term in combined for term in [
+            "housing starts",
+            "building permits",
+            "building permit",
+            "residential construction",
+            "housing construction",
+        ])
 
     def _is_property_price_query(self, query_lower: str, indicators: List[str]) -> bool:
         """Check if query is about property/house prices."""

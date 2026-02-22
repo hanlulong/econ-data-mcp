@@ -121,3 +121,15 @@ def test_translate_pmi_to_fred():
 
     assert concept == "pmi"
     assert code == "NAPM"
+
+
+def test_translate_debt_service_ratio_to_bis():
+    translator = IndicatorTranslator()
+
+    code, concept = translator.translate_indicator(
+        "debt service ratio",
+        target_provider="BIS",
+    )
+
+    assert concept == "debt_service_ratio"
+    assert code == "WS_DSR"

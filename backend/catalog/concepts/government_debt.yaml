@@ -19,6 +19,8 @@ synonyms:
 
 explicit_exclusions:
   - household debt
+  - debt service
+  - debt service ratio
   - corporate debt
   - private debt
   - external debt

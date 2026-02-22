@@ -211,6 +211,127 @@ class QueryServiceTests(unittest.TestCase):
 
         self.assertEqual(fetch_mock.call_args.kwargs.get("indicator"), "BIS.CBPOL")
 
+    def test_is_resolved_indicator_plausible_rejects_bis_debt_service_for_debt_gdp_query(self) -> None:
+        self.assertFalse(
+            self.service._is_resolved_indicator_plausible(  # pylint: disable=protected-access
+                provider="BIS",
+                indicator_query="gdp to debt ratio in china",
+                resolved_code="WS_DSR",
+            )
+        )
+
+        self.assertTrue(
+            self.service._is_resolved_indicator_plausible(  # pylint: disable=protected-access
+                provider="BIS",
+                indicator_query="debt service ratio in china",
+                resolved_code="WS_DSR",
+            )
+        )
+
+    def test_build_uncertain_result_clarification_returns_ranked_options(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="BIS",
+            indicators=["GDP to Debt Ratio"],
+            parameters={"country": "CN"},
+            clarificationNeeded=False,
+            originalQuery="gdp to debt ratio in china",
+        )
+        uncertain_data = [
+            NormalizedData.model_validate(
+                {
+                    "metadata": {
+                        "source": "BIS",
+                        "indicator": "Debt service ratios",
+                        "country": "CN",
+                        "frequency": "quarterly",
+                        "unit": "percent",
+                        "lastUpdated": "",
+                        "seriesId": "WS_DSR",
+                    },
+                    "data": [
+                        {"date": "2020-01-01", "value": 1.0},
+                    ],
+                }
+            )
+        ]
+
+        class _Resolved:
+            def __init__(self, provider: str, code: str, name: str, confidence: float):
+                self.provider = provider
+                self.code = code
+                self.name = name
+                self.confidence = confidence
+                self.source = "catalog"
+
+        class _Resolver:
+            def resolve(self, query, provider=None, **kwargs):
+                mapping = {
+                    "IMF": _Resolved("IMF", "GGXWDG_NGDP", "General government gross debt (% of GDP)", 0.95),
+                    "WORLDBANK": _Resolved("WORLDBANK", "GC.DOD.TOTL.GD.ZS", "Central government debt, total (% of GDP)", 0.92),
+                    "BIS": _Resolved("BIS", "WS_DSR", "Debt service ratios", 0.90),
+                }
+                key = (provider or "").upper()
+                return mapping.get(key)
+
+        with patch("backend.services.query.get_indicator_resolver", return_value=_Resolver()), \
+             patch.object(self.service, "_get_fallback_providers", return_value=["IMF", "WORLDBANK"]):
+            clarification = self.service._build_uncertain_result_clarification(  # pylint: disable=protected-access
+                conversation_id="conv-1",
+                query="gdp to debt ratio in china",
+                intent=intent,
+                data=uncertain_data,
+                processing_steps=None,
+            )
+
+        self.assertIsNotNone(clarification)
+        assert clarification is not None
+        self.assertTrue(clarification.clarificationNeeded)
+        joined = "\n".join(clarification.clarificationQuestions or [])
+        self.assertIn("IMF", joined)
+        self.assertIn("WorldBank", joined)
+
+    def test_collect_indicator_choice_options_prefers_raw_query_on_cue_mismatch(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="WorldBank",
+            indicators=["GDP (current US$)"],
+            parameters={"countries": ["China", "UK"]},
+            clarificationNeeded=False,
+            originalQuery="gdp to debt ratio in china and uk",
+        )
+
+        class _Resolved:
+            def __init__(self, provider: str, code: str, name: str, confidence: float):
+                self.provider = provider
+                self.code = code
+                self.name = name
+                self.confidence = confidence
+                self.source = "catalog"
+
+        captured_queries = []
+
+        class _Resolver:
+            def resolve(self, query, provider=None, **kwargs):
+                captured_queries.append(str(query))
+                mapping = {
+                    "IMF": _Resolved("IMF", "GGXWDG_NGDP", "General government gross debt (% of GDP)", 0.95),
+                    "WORLDBANK": _Resolved("WORLDBANK", "GC.DOD.TOTL.GD.ZS", "Central government debt, total (% of GDP)", 0.92),
+                }
+                return mapping.get((provider or "").upper())
+
+        with patch.object(self.service, "_select_indicator_query_for_resolution", return_value="GDP (current US$)"), \
+             patch("backend.services.query.get_indicator_resolver", return_value=_Resolver()), \
+             patch.object(self.service, "_get_fallback_providers", return_value=["IMF"]):
+            options = self.service._collect_indicator_choice_options(  # pylint: disable=protected-access
+                query="gdp to debt ratio in china and uk",
+                intent=intent,
+                max_options=3,
+            )
+
+        self.assertTrue(options)
+        self.assertTrue(any("debt" in option.lower() for option in options))
+        self.assertTrue(captured_queries)
+        self.assertEqual(captured_queries[0], "gdp to debt ratio in china and uk")
+
     def test_eurostat_fetch_prefers_resolved_indicator_param(self) -> None:
         intent = ParsedIntent(
             apiProvider="Eurostat",
@@ -291,6 +412,41 @@ class QueryServiceTests(unittest.TestCase):
         self.service.hybrid_router = _HybridRouter()
 
         provider = run(self.service._select_routed_provider(intent, "government debt in china"))  # pylint: disable=protected-access
+        self.assertEqual(provider, "IMF")
+
+    def test_select_routed_provider_keeps_high_confidence_deterministic_match(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="WorldBank",
+            indicators=["gdp to debt ratio"],
+            parameters={"country": "CN"},
+            clarificationNeeded=False,
+        )
+
+        class _UnifiedRouter:
+            def route(self, **kwargs):
+                return RoutingDecision(
+                    provider="IMF",
+                    confidence=0.90,
+                    fallbacks=["WorldBank", "BIS"],
+                    reasoning="deterministic macro debt rule",
+                    match_type="indicator",
+                )
+
+        class _SemanticRouter:
+            async def route(self, **kwargs):
+                return RoutingDecision(
+                    provider="BIS",
+                    confidence=0.58,
+                    fallbacks=["IMF", "WorldBank"],
+                    reasoning="semantic-router similarity match (0.58)",
+                    match_type="semantic",
+                )
+
+        self.service.unified_router = _UnifiedRouter()
+        self.service.semantic_provider_router = _SemanticRouter()
+        self.service.hybrid_router = None
+
+        provider = run(self.service._select_routed_provider(intent, "gdp to debt ratio in china"))  # pylint: disable=protected-access
         self.assertEqual(provider, "IMF")
 
     def test_select_routed_provider_uses_unified_router_baseline(self) -> None:

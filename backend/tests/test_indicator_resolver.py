@@ -213,6 +213,16 @@ class IndicatorResolverTests(unittest.TestCase):
         self.assertEqual(result.code, "RSAFS")
         self.assertEqual(result.source, "catalog")
 
+    def test_resolves_debt_service_ratio_to_bis_catalog_code(self):
+        lookup = _FakeLookup(search_results=[])
+        resolver = IndicatorResolver(lookup=lookup, translator=IndicatorTranslator())
+
+        result = resolver.resolve("debt service ratio", provider="BIS", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "WS_DSR")
+        self.assertIn(result.source, {"catalog", "translator"})
+
     def test_resolves_industrial_production_via_catalog(self):
         lookup = _FakeLookup(search_results=[])
         resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())

@@ -139,7 +139,7 @@ def _safe_get_source(data: List[NormalizedData]) -> str:
 
 class QueryService:
     # Bump when cache semantics change so stale entries from old logic are not reused.
-    CACHE_KEY_VERSION = "2026-02-21.1"
+    CACHE_KEY_VERSION = "2026-02-21.2"
 
     def __init__(
         self,
@@ -314,6 +314,8 @@ class QueryService:
         raw_countries = params.get("countries")
         countries = raw_countries if isinstance(raw_countries, list) else []
         routed_provider = normalize_provider_name(intent.apiProvider or "")
+        deterministic_confidence = 0.0
+        deterministic_match_type = "legacy"
         try:
             deterministic_decision = self.unified_router.route(
                 query=query,
@@ -323,6 +325,8 @@ class QueryService:
                 llm_provider=intent.apiProvider,
             )
             routed_provider = normalize_provider_name(deterministic_decision.provider)
+            deterministic_confidence = float(deterministic_decision.confidence or 0.0)
+            deterministic_match_type = str(deterministic_decision.match_type or "deterministic").lower()
             logger.info(
                 "🧭 UnifiedRouter baseline: %s (conf=%.2f, type=%s)",
                 routed_provider,
@@ -357,6 +361,24 @@ class QueryService:
                     query,
                     intent.indicators,
                 )
+                semantic_confidence = float(getattr(decision, "confidence", 0.0) or 0.0)
+                # Framework guardrail: preserve high-confidence deterministic decisions unless
+                # semantic routing is materially stronger. This prevents low-similarity
+                # semantic matches from overriding precise rule-based routing.
+                if semantic_provider != routed_provider:
+                    deterministic_locked = (
+                        deterministic_confidence >= 0.88
+                        and deterministic_match_type in {"explicit", "us_only", "indicator"}
+                    )
+                    semantic_materially_stronger = semantic_confidence >= (deterministic_confidence + 0.05)
+                    if deterministic_locked and not semantic_materially_stronger:
+                        logger.info(
+                            "🧭 Semantic override skipped: keep %s (deterministic conf=%.2f, semantic conf=%.2f)",
+                            routed_provider,
+                            deterministic_confidence,
+                            semantic_confidence,
+                        )
+                        return routed_provider
                 if semantic_provider != routed_provider:
                     logger.info(
                         "🧭 Semantic routing override: %s -> %s (%s)",
@@ -440,9 +462,31 @@ class QueryService:
             "export": {"export", "exports"},
             "trade_balance": {"trade balance", "trade surplus", "trade deficit"},
             "debt": {"debt", "liability", "liabilities"},
+            "debt_service": {"debt service", "debt service ratio", "dsr"},
+            "debt_gdp_ratio": {
+                "debt to gdp",
+                "debt-to-gdp",
+                "debt as % of gdp",
+                "debt as percentage of gdp",
+                "% of gdp debt",
+                "gdp to debt ratio",
+                "gdp/debt ratio",
+            },
+            "public_debt": {
+                "government debt",
+                "public debt",
+                "sovereign debt",
+                "national debt",
+                "central government debt",
+                "general government debt",
+            },
+            "household_debt": {"household debt"},
             "unemployment": {"unemployment", "jobless"},
             "inflation": {"inflation", "consumer price", "cpi"},
             "savings": {"saving", "savings"},
+            "credit": {"credit", "lending", "loan"},
+            "exchange_rate": {"exchange rate", "forex", "fx", "reer", "neer", "effective exchange rate"},
+            "gdp": {"gdp", "gross domestic product"},
         }
 
         cues: set[str] = set()
@@ -450,6 +494,510 @@ class QueryService:
             if any(phrase in text_lower for phrase in phrases):
                 cues.add(cue)
         return cues
+
+    def _series_text_for_relevance(self, series: Any) -> str:
+        """Build a comparable text blob from a series metadata payload."""
+        metadata = None
+        if series is not None and hasattr(series, "metadata"):
+            metadata = getattr(series, "metadata", None)
+        elif isinstance(series, dict):
+            metadata = series.get("metadata")
+
+        if metadata is None:
+            return ""
+
+        if hasattr(metadata, "model_dump"):
+            meta_dict = metadata.model_dump()
+        elif isinstance(metadata, dict):
+            meta_dict = metadata
+        else:
+            meta_dict = {}
+
+        return " ".join(
+            str(meta_dict.get(key) or "")
+            for key in ("indicator", "seriesId", "description", "source", "country", "unit")
+        ).strip()
+
+    def _score_series_relevance(self, query: str, series: Any) -> float:
+        """Score semantic relevance of one returned series to the original query."""
+        query_text = str(query or "").lower()
+        series_text = self._series_text_for_relevance(series).lower()
+        if not series_text:
+            return -1.0
+
+        score = 0.0
+        query_cues = self._extract_indicator_cues(query_text)
+        series_cues = self._extract_indicator_cues(series_text)
+
+        if query_cues:
+            cue_overlap = query_cues & series_cues
+            score += float(len(cue_overlap)) * 2.5
+            if not cue_overlap:
+                score -= 2.0
+
+        query_terms = self._tokenize_indicator_terms(query_text)
+        series_terms = self._tokenize_indicator_terms(series_text)
+        if query_terms and series_terms:
+            lexical_overlap = len(query_terms & series_terms)
+            score += min(2.5, lexical_overlap * 0.35)
+
+        ratio_patterns = [
+            "% of gdp",
+            "as % of gdp",
+            "as percent of gdp",
+            "as percentage of gdp",
+            "share of gdp",
+            "to gdp ratio",
+            "ratio to gdp",
+            "as share of gdp",
+        ]
+        has_ratio_query = any(pattern in query_text for pattern in ratio_patterns)
+        has_ratio_series = any(pattern in series_text for pattern in ratio_patterns)
+        if has_ratio_query:
+            if has_ratio_series:
+                score += 2.5
+            else:
+                score -= 1.8
+
+        # Penalize directional mismatches.
+        if "import" in query_cues and "import" not in series_cues and "trade_balance" not in series_cues:
+            score -= 2.2
+        if "export" in query_cues and "export" not in series_cues and "trade_balance" not in series_cues:
+            score -= 2.2
+        if "trade_balance" in query_cues and "trade_balance" not in series_cues:
+            score -= 2.2
+        if "debt_service" in query_cues and "debt_service" not in series_cues:
+            score -= 2.2
+        if "debt_gdp_ratio" in query_cues:
+            if "debt_gdp_ratio" in series_cues:
+                score += 2.5
+            else:
+                score -= 2.8
+            if "debt_service" in series_cues:
+                score -= 3.0
+        if "public_debt" in query_cues and "public_debt" not in series_cues:
+            if ("household_debt" in series_cues) or ("credit" in series_cues) or ("debt_service" in series_cues):
+                score -= 2.4
+        if "credit" in query_cues and "credit" not in series_cues:
+            score -= 1.8
+        if "exchange_rate" in query_cues and "exchange_rate" not in series_cues:
+            score -= 1.8
+
+        # Generic GDP series should not dominate directional/ratio trade queries.
+        if "gdp (current us$)" in series_text and ({"import", "export", "trade_balance"} & query_cues):
+            score -= 3.0
+
+        # Trade flow totals are usually not ratio indicators.
+        if has_ratio_query and "total trade" in series_text:
+            score -= 1.5
+
+        return score
+
+    def _rerank_data_by_query_relevance(self, query: str, data: List[Any]) -> List[Any]:
+        """
+        Reorder (and lightly filter) returned series by semantic relevance to query.
+
+        This is a framework-level guardrail against agent over-decomposition where
+        unrelated series can be returned before the intended concept.
+        """
+        if not data:
+            return data
+
+        scored: List[tuple[float, int, Any]] = []
+        for idx, series in enumerate(data):
+            scored.append((self._score_series_relevance(query, series), idx, series))
+
+        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        reranked = [item[2] for item in scored]
+
+        top_score = scored[0][0] if scored else 0.0
+        if top_score < 0.8:
+            return reranked
+
+        # Keep all strong matches; discard clearly irrelevant tail when we have good matches.
+        filtered = [series for score, _, series in scored if score >= max(0.0, top_score - 3.0)]
+        return filtered or reranked
+
+    def _provider_supports_country_for_options(self, provider: str, country_iso2: Optional[str]) -> bool:
+        """Lightweight country-coverage filter for clarification options."""
+        if not country_iso2:
+            return True
+
+        provider_upper = normalize_provider_name(provider)
+        iso2 = country_iso2.upper()
+
+        if provider_upper == "EUROSTAT":
+            return CountryResolver.is_eu_member(iso2)
+        if provider_upper in {"STATSCAN", "STATISTICS CANADA"}:
+            return iso2 == "CA"
+        if provider_upper == "FRED":
+            return iso2 == "US"
+        if provider_upper == "BIS":
+            return iso2 in BISProvider.BIS_SUPPORTED_COUNTRIES
+        return True
+
+    def _collect_indicator_choice_options(
+        self,
+        query: str,
+        intent: ParsedIntent,
+        max_options: int = 4,
+    ) -> List[str]:
+        """
+        Build ranked indicator options across plausible providers for user clarification.
+        """
+        if not intent:
+            return []
+
+        raw_query = str(query or "").strip()
+        indicator_query = self._select_indicator_query_for_resolution(intent) or raw_query
+        if raw_query:
+            raw_cues = self._extract_indicator_cues(raw_query)
+            indicator_cues = self._extract_indicator_cues(indicator_query)
+            high_signal_raw_cues = {cue for cue in raw_cues if cue not in {"gdp"}}
+            if (
+                ("debt_gdp_ratio" in raw_cues and "debt_gdp_ratio" not in indicator_cues)
+                or (high_signal_raw_cues and not (high_signal_raw_cues & indicator_cues))
+            ):
+                indicator_query = raw_query
+        if not indicator_query:
+            return []
+
+        target_countries = self._collect_target_countries(intent.parameters)
+        target_country = target_countries[0] if target_countries else None
+        target_iso2 = [
+            iso2
+            for iso2 in (self._normalize_country_to_iso2(country) for country in target_countries)
+            if iso2
+        ]
+
+        primary_provider = normalize_provider_name(intent.apiProvider or "")
+        fallback_candidates = self._get_fallback_providers(
+            primary_provider,
+            indicator_query,
+            country=target_country,
+            countries=target_countries,
+        )
+
+        provider_candidates = []
+        for provider_name in [
+            primary_provider,
+            *fallback_candidates,
+            "IMF",
+            "WORLDBANK",
+            "BIS",
+            "OECD",
+            "EUROSTAT",
+            "FRED",
+        ]:
+            normalized = normalize_provider_name(provider_name)
+            if normalized and normalized not in provider_candidates:
+                provider_candidates.append(normalized)
+
+        resolver = get_indicator_resolver()
+        scored_options: List[tuple[float, str, str]] = []
+        seen_codes: set[tuple[str, str]] = set()
+        provider_labels = {
+            "WORLDBANK": "WorldBank",
+            "EUROSTAT": "Eurostat",
+            "STATSCAN": "StatsCan",
+            "COMTRADE": "Comtrade",
+        }
+
+        for provider_name in provider_candidates:
+            # Skip providers that clearly don't cover the requested country context.
+            if target_iso2 and not any(
+                self._provider_supports_country_for_options(provider_name, iso2)
+                for iso2 in target_iso2
+            ):
+                continue
+
+            try:
+                resolved = resolver.resolve(
+                    indicator_query,
+                    provider=provider_name,
+                    country=target_country,
+                    countries=target_countries or None,
+                )
+            except Exception:
+                resolved = None
+
+            if not resolved or not resolved.code or resolved.confidence < 0.55:
+                continue
+
+            code_key = (provider_name, str(resolved.code).upper())
+            if code_key in seen_codes:
+                continue
+            seen_codes.add(code_key)
+
+            synthetic_series = {
+                "metadata": {
+                    "indicator": resolved.name or "",
+                    "seriesId": resolved.code,
+                    "source": provider_name,
+                }
+            }
+            relevance_score = self._score_series_relevance(query, synthetic_series)
+            if relevance_score < -2.0:
+                continue
+
+            combined_score = float(resolved.confidence) + (0.12 * relevance_score)
+            provider_label = provider_labels.get(provider_name, provider_name)
+            option_name = str(resolved.name or resolved.code or "").replace("_", " ").strip()
+            option_text = f"[{provider_label}] {option_name} ({resolved.code})"
+            scored_options.append((combined_score, option_text, provider_name))
+
+        scored_options.sort(key=lambda item: item[0], reverse=True)
+        return [option for _, option, _ in scored_options[:max_options]]
+
+    def _needs_indicator_clarification(
+        self,
+        query: str,
+        data: List[Any],
+        intent: Optional[ParsedIntent] = None,
+    ) -> bool:
+        """
+        Determine whether returned data looks semantically uncertain for the query.
+        """
+        if not data:
+            return False
+
+        scored: List[tuple[float, Any]] = [
+            (self._score_series_relevance(query, series), series)
+            for series in data
+        ]
+        scored.sort(key=lambda item: item[0], reverse=True)
+
+        top_score, top_series = scored[0]
+        top_meta = getattr(top_series, "metadata", None)
+        query_cues = self._extract_indicator_cues(query)
+        top_series_cues = self._extract_indicator_cues(self._series_text_for_relevance(top_series))
+        high_signal_query_cues = {cue for cue in query_cues if cue not in {"gdp"}}
+
+        # Cross-check with provider-agnostic resolver for framework-level ambiguity detection.
+        # If the best canonical match disagrees with returned series/provider, ask clarification.
+        try:
+            resolver = get_indicator_resolver()
+            target_countries = self._collect_target_countries(intent.parameters) if intent else []
+            target_country = target_countries[0] if target_countries else None
+            canonical = resolver.resolve(
+                query,
+                country=target_country,
+                countries=target_countries or None,
+            )
+
+            if canonical and canonical.confidence >= 0.8 and top_meta:
+                top_provider = normalize_provider_name(getattr(top_meta, "source", "") or "")
+                canonical_provider = normalize_provider_name(canonical.provider or "")
+                top_indicator = str(getattr(top_meta, "indicator", "") or "")
+                top_series_id = str(getattr(top_meta, "seriesId", "") or "")
+                top_code = top_series_id or (
+                    top_indicator if self._looks_like_provider_indicator_code(top_provider, top_indicator) else ""
+                )
+                canonical_code = str(canonical.code or "")
+
+                def _codes_match(lhs: str, rhs: str) -> bool:
+                    left = str(lhs or "").upper().strip()
+                    right = str(rhs or "").upper().strip()
+                    if not left or not right:
+                        return False
+                    if left == right:
+                        return True
+                    left_prefix = re.split(r"[_.]", left)[0]
+                    right_prefix = re.split(r"[_.]", right)[0]
+                    if len(left_prefix) >= 5 and left_prefix == right_prefix:
+                        return True
+                    return False
+
+                if top_provider and canonical_provider and top_code and canonical_code:
+                    if top_provider != canonical_provider and top_score < 2.0:
+                        return True
+                    if not _codes_match(top_code, canonical_code) and top_score < 2.0:
+                        return True
+                    # Canonical match aligns with returned series/provider.
+                    if top_provider == canonical_provider and _codes_match(top_code, canonical_code):
+                        return False
+        except Exception:
+            pass
+
+        if "debt_gdp_ratio" in query_cues and "debt_gdp_ratio" not in top_series_cues:
+            return True
+        if (
+            "public_debt" in query_cues
+            and "public_debt" not in top_series_cues
+            and ("debt_service" in top_series_cues or "credit" in top_series_cues)
+        ):
+            return True
+        if high_signal_query_cues and not (high_signal_query_cues & top_series_cues) and top_score < 2.0:
+            return True
+        if top_score < 0.25:
+            return True
+
+        if len(scored) > 1:
+            score_gap = scored[0][0] - scored[1][0]
+            if score_gap < 0.2:
+                second_series_cues = self._extract_indicator_cues(
+                    self._series_text_for_relevance(scored[1][1])
+                )
+                if top_series_cues != second_series_cues:
+                    return True
+
+        return False
+
+    def _build_uncertain_result_clarification(
+        self,
+        conversation_id: str,
+        query: str,
+        intent: Optional[ParsedIntent],
+        data: List[Any],
+        processing_steps: Optional[List[Any]] = None,
+    ) -> Optional[QueryResponse]:
+        """
+        Return a clarification response with options when series selection is uncertain.
+        """
+        if not intent or not self._needs_indicator_clarification(query, data, intent):
+            return None
+
+        options = self._collect_indicator_choice_options(query, intent)
+        if len(options) < 2:
+            return None
+
+        top_series = data[0] if data else None
+        top_meta = getattr(top_series, "metadata", None) if top_series else None
+        current_label = (
+            f"{getattr(top_meta, 'indicator', 'Unknown indicator')} "
+            f"from {getattr(top_meta, 'source', 'unknown source')}"
+            if top_meta else "Unknown indicator"
+        )
+
+        clarification_questions = [
+            "I found multiple plausible indicators and the current match is uncertain.",
+            f"Current match: {current_label}",
+            "Please choose one option:",
+        ]
+        clarification_questions.extend(
+            f"{idx}. {option}" for idx, option in enumerate(options, start=1)
+        )
+        clarification_questions.append(
+            "Reply with the option number (for example, 1) or the exact indicator text you want."
+        )
+
+        return QueryResponse(
+            conversationId=conversation_id,
+            intent=intent,
+            clarificationNeeded=True,
+            clarificationQuestions=clarification_questions,
+            processingSteps=processing_steps,
+        )
+
+    def _looks_like_provider_indicator_code(self, provider: str, indicator: str) -> bool:
+        """Heuristic check for provider-native indicator code formats."""
+        if not indicator:
+            return False
+
+        indicator_text = str(indicator).strip()
+        if not indicator_text:
+            return False
+
+        provider_upper = normalize_provider_name(provider)
+        code_upper = indicator_text.upper()
+
+        if provider_upper in {"WORLDBANK", "WORLD BANK"}:
+            # Examples: NE.IMP.GNFS.ZS, NY.GDP.MKTP.CD
+            return bool(re.fullmatch(r"[A-Z]{2}\.[A-Z0-9]{2,}(?:\.[A-Z0-9]{2,}){1,4}", code_upper))
+
+        if provider_upper == "BIS":
+            # Examples: WS_CBPOL, WS_SPP
+            return code_upper.startswith("WS_")
+
+        if provider_upper == "IMF":
+            # IMF codes are often uppercase with underscores/dots.
+            return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9_\.]{2,}", code_upper))
+
+        if provider_upper == "FRED":
+            # FRED series IDs are usually uppercase alphanumeric (no spaces).
+            return bool(re.fullmatch(r"[A-Z0-9]{3,}", code_upper))
+
+        if provider_upper == "EUROSTAT":
+            return bool(re.fullmatch(r"[A-Z0-9_@\.]{4,}", code_upper))
+
+        if provider_upper == "OECD":
+            # Examples: DSD_...@DF_..., CPI, IRLT
+            return bool(re.fullmatch(r"[A-Z0-9_@\.]{5,}", code_upper))
+
+        if provider_upper in {"STATSCAN", "STATISTICS CANADA"}:
+            return bool(re.fullmatch(r"[A-Z0-9_]{3,}", code_upper))
+
+        return False
+
+    def _is_resolved_indicator_plausible(
+        self,
+        provider: str,
+        indicator_query: str,
+        resolved_code: str,
+    ) -> bool:
+        """
+        Lightweight semantic plausibility check for resolved provider codes.
+
+        Prevents high-confidence but semantically off-target code matches from
+        overriding clearer natural-language intent (especially for opaque FRED IDs).
+        """
+        provider_upper = normalize_provider_name(provider)
+        query_cues = self._extract_indicator_cues(indicator_query or "")
+        code_upper = str(resolved_code or "").upper()
+
+        if not query_cues:
+            return True
+
+        if provider_upper == "FRED":
+            domain_tokens = {
+                "credit": ("CREDIT", "LOAN", "LEND", "TOTBKCR", "BUSLOANS", "REVOL", "NONREV", "TOTALSL"),
+                "inflation": ("CPI", "PPI", "PCE", "DEFL", "INFL"),
+                "exchange_rate": ("DEX", "EXCH", "XRU", "REER"),
+                "trade_balance": ("BOP", "TRADE", "NETEXP"),
+                "import": ("IMP", "IMPORT"),
+                "export": ("EXP", "EXPORT"),
+            }
+
+            for cue, tokens in domain_tokens.items():
+                if cue in query_cues and not any(token in code_upper for token in tokens):
+                    return False
+
+        if provider_upper == "BIS":
+            # Guardrail: generic debt-to-GDP queries should not resolve to BIS debt-service series.
+            if "debt_gdp_ratio" in query_cues:
+                if code_upper == "WS_DSR":
+                    return False
+                # WS_TC is valid for BIS credit/household debt contexts, but not generic public debt.
+                if code_upper == "WS_TC" and not (
+                    query_cues & {"credit", "household_debt", "debt_service"}
+                ):
+                    return False
+
+            if "debt_service" in query_cues and code_upper != "WS_DSR":
+                return False
+
+        return True
+
+    def _indicator_resolution_threshold(self, indicator_query: str, resolved_source: str) -> float:
+        """
+        Dynamic acceptance threshold for resolver output.
+
+        Long natural-language indicator prompts and directional trade queries tend to
+        score lower in lexical systems; use a slightly lower threshold there while
+        keeping strict defaults for weakly-signaled queries.
+        """
+        threshold = 0.70
+        normalized_query = str(indicator_query or "").strip().lower()
+        cue_set = self._extract_indicator_cues(normalized_query)
+
+        if cue_set:
+            threshold = 0.60
+        if len(normalized_query.split()) >= 6:
+            threshold = min(threshold, 0.62)
+        if resolved_source in {"catalog", "translator"}:
+            threshold = min(threshold, 0.60)
+
+        return threshold
 
     def _select_indicator_query_for_resolution(self, intent: ParsedIntent) -> str:
         """
@@ -468,6 +1016,26 @@ class QueryService:
         original_query = str(intent.originalQuery or "").strip()
         if not original_query:
             return indicator_query
+
+        ratio_patterns = [
+            "% of gdp",
+            "as % of gdp",
+            "as percent of gdp",
+            "as percentage of gdp",
+            "share of gdp",
+            "to gdp ratio",
+            "ratio to gdp",
+            "as share of gdp",
+        ]
+        original_lower = original_query.lower()
+        indicator_lower = indicator_query.lower()
+        has_ratio_original = any(pattern in original_lower for pattern in ratio_patterns)
+        has_ratio_indicator = any(pattern in indicator_lower for pattern in ratio_patterns)
+        if has_ratio_original and not has_ratio_indicator:
+            logger.info(
+                "🔎 Indicator dropped GDP-ratio context. Using original query for resolution."
+            )
+            return original_query
 
         original_cues = self._extract_indicator_cues(original_query)
         indicator_cues = self._extract_indicator_cues(indicator_query)
@@ -737,13 +1305,17 @@ class QueryService:
             return []
 
         countries: List[str] = []
-        raw_countries = parameters.get("countries")
-        if isinstance(raw_countries, list):
-            countries.extend(str(country) for country in raw_countries if country)
+        for key in ("countries", "reporters", "partner"):
+            value = parameters.get(key)
+            if isinstance(value, list):
+                countries.extend(str(item) for item in value if item)
+            elif value:
+                countries.append(str(value))
 
-        raw_country = parameters.get("country")
-        if raw_country:
-            countries.append(str(raw_country))
+        for key in ("country", "reporter"):
+            value = parameters.get(key)
+            if value:
+                countries.append(str(value))
 
         # Preserve order while removing duplicates.
         return list(dict.fromkeys(countries))
@@ -974,6 +1546,7 @@ class QueryService:
         original_indicators: List[str],
         fallback_result: List[NormalizedData],
         target_countries: Optional[List[str]] = None,
+        original_query: Optional[str] = None,
     ) -> bool:
         """
         Check if fallback result is semantically related to the original query.
@@ -1082,8 +1655,15 @@ class QueryService:
                     terms.add(clean)
             return terms
 
-        # Get terms from original indicators
-        original_text = ' '.join(original_indicators).lower()
+        # Get terms from original indicators + query text (when available)
+        # so generic parsed indicators like "trade" still preserve directionality
+        # from the original user phrasing ("imports", "exports", etc.).
+        original_text = " ".join(
+            part for part in [
+                ' '.join(original_indicators).lower(),
+                str(original_query or "").lower(),
+            ] if part
+        )
         original_terms = extract_key_terms(original_text)
 
         if not original_terms:
@@ -1148,9 +1728,25 @@ class QueryService:
             # CRITICAL CHECK 2: Metric type matching with qualifier awareness
             # "total assets" vs "fixed assets" are different concepts
             if original_metrics and result_metrics:
-                if not (original_metrics & result_metrics):
+                overlap_metrics = original_metrics & result_metrics
+                if not overlap_metrics:
+                    trade_family = {'trade', 'imports', 'exports', 'deficit', 'surplus', 'balance'}
+                    if not ((original_metrics & trade_family) and (result_metrics & trade_family)):
+                        logger.warning(
+                            f"Fallback rejected: metrics don't match - original={original_metrics}, result={result_metrics}"
+                        )
+                        return False
+                # Preserve import/export direction when explicitly present.
+                if 'imports' in original_metrics and 'imports' not in result_metrics and 'trade' not in result_metrics:
                     logger.warning(
-                        f"Fallback rejected: metrics don't match - original={original_metrics}, result={result_metrics}"
+                        "Fallback rejected: requested imports but result metric set was %s",
+                        result_metrics,
+                    )
+                    return False
+                if 'exports' in original_metrics and 'exports' not in result_metrics and 'trade' not in result_metrics:
+                    logger.warning(
+                        "Fallback rejected: requested exports but result metric set was %s",
+                        result_metrics,
                     )
                     return False
 
@@ -1246,7 +1842,12 @@ class QueryService:
                 result = await self._fetch_data(fallback_intent)
 
                 # Validate fallback result is semantically related to original query
-                if result and self._is_fallback_relevant(intent.indicators, result, target_countries):
+                if result and self._is_fallback_relevant(
+                    intent.indicators,
+                    result,
+                    target_countries,
+                    intent.originalQuery,
+                ):
                     logger.info(f"✅ Fallback to {fallback_provider} succeeded")
                     return result
                 else:
@@ -1504,6 +2105,17 @@ class QueryService:
                     processingSteps=tracker.to_list(),
                 )
 
+            data = self._rerank_data_by_query_relevance(query, data)
+            clarification_response = self._build_uncertain_result_clarification(
+                conversation_id=conv_id,
+                query=query,
+                intent=intent,
+                data=data,
+                processing_steps=tracker.to_list(),
+            )
+            if clarification_response:
+                return clarification_response
+
             conv_id = conversation_manager.add_message_safe(
                 conv_id,
                 "assistant",
@@ -1663,12 +2275,18 @@ class QueryService:
         # This replaces scattered resolution logic across providers
         resolver = get_indicator_resolver()
 
-        # Ensure indicator is in params for providers that need it
-        # (when LLM parsed it into intent.indicators but not into params)
-        if not params.get("indicator") and intent.indicators:
-            if provider in {"STATSCAN", "STATISTICS CANADA", "FRED", "IMF", "WORLDBANK", "EUROSTAT", "OECD", "BIS"}:
-                # Try IndicatorResolver first for enhanced resolution
-                indicator_query = self._select_indicator_query_for_resolution(intent)
+        # Resolve/validate indicator for providers that require normalized indicator codes.
+        # IMPORTANT: run this even when params already has "indicator" because LLM-provided
+        # values can be noisy (raw query text, wrong provider code, or invalid pseudo-codes).
+        if provider in {"STATSCAN", "STATISTICS CANADA", "FRED", "IMF", "WORLDBANK", "EUROSTAT", "OECD", "BIS"}:
+            existing_indicator = str(params.get("indicator") or "").strip()
+            indicator_query = self._select_indicator_query_for_resolution(intent)
+            if not indicator_query and intent.indicators:
+                indicator_query = str(intent.indicators[0] or "").strip()
+            if not indicator_query:
+                indicator_query = existing_indicator
+
+            if indicator_query:
                 country_context = params.get("country")
                 countries_context = params.get("countries") if isinstance(params.get("countries"), list) else None
                 original_query_text = str(intent.originalQuery or "").strip()
@@ -1678,14 +2296,38 @@ class QueryService:
                     and bool(intent.indicators)
                     and indicator_query != str(intent.indicators[0] or "").strip()
                 )
+
                 resolved = resolver.resolve(
                     indicator_query,
                     provider=provider,
                     country=country_context,
                     countries=countries_context,
                 )
-                if resolved and resolved.confidence >= 0.7:
-                    logger.info(f"🔍 IndicatorResolver: '{indicator_query}' → '{resolved.code}' (confidence: {resolved.confidence:.2f}, source: {resolved.source})")
+
+                accepted_resolved = False
+                if resolved:
+                    threshold = self._indicator_resolution_threshold(
+                        indicator_query=indicator_query,
+                        resolved_source=resolved.source,
+                    )
+                    accepted_resolved = resolved.confidence >= threshold
+                    if accepted_resolved and not self._is_resolved_indicator_plausible(
+                        provider=provider,
+                        indicator_query=indicator_query,
+                        resolved_code=resolved.code,
+                    ):
+                        accepted_resolved = False
+                    logger.info(
+                        "🔍 IndicatorResolver candidate: '%s' → '%s' (conf=%.2f, src=%s, threshold=%.2f, accepted=%s)",
+                        indicator_query,
+                        resolved.code,
+                        resolved.confidence,
+                        resolved.source,
+                        threshold,
+                        accepted_resolved,
+                    )
+
+                if accepted_resolved and resolved:
                     params = {**params, "indicator": resolved.code}
                     # World Bank fetch path can iterate raw intent.indicators when multiple
                     # are present. If we intentionally overrode to original query for better
@@ -1698,8 +2340,13 @@ class QueryService:
                         )
                         intent.indicators = [resolved.code]
                 else:
-                    # Fallback to original indicator
-                    params = {**params, "indicator": indicator_query}
+                    # Keep provider-native explicit indicator codes when present;
+                    # otherwise use the best available natural-language indicator query.
+                    if existing_indicator and self._looks_like_provider_indicator_code(provider, existing_indicator):
+                        params = {**params, "indicator": existing_indicator}
+                    else:
+                        params = {**params, "indicator": indicator_query}
+
                 intent.parameters = params  # ensure downstream consumers see indicator
 
         # Check catalog availability: if provider is in not_available list for this indicator,
@@ -1850,9 +2497,15 @@ class QueryService:
                         frequency=params.get("frequency", "annual"),
                     )
                     return [series]
+                reporter_value = params.get("reporter") or params.get("country")
+                reporters_value = params.get("reporters") or params.get("countries")
+                # If an explicit reporter is present (common for bilateral queries),
+                # ignore broad countries[] context to avoid duplicate/misaligned fan-out.
+                if reporter_value:
+                    reporters_value = None
                 return await self.comtrade_provider.fetch_trade_data(
-                    reporter=params.get("reporter") or params.get("country"),
-                    reporters=params.get("reporters") or params.get("countries"),
+                    reporter=reporter_value,
+                    reporters=reporters_value,
                     partner=params.get("partner"),
                     commodity=params.get("commodity"),
                     flow=params.get("flow"),
@@ -2865,6 +3518,28 @@ class QueryService:
                         )
                     response.intent.parameters["legend_labels"] = result.get("legend_labels")
 
+                if data and not response.intent:
+                    valid_data = _filter_valid_data(data)
+                    if valid_data:
+                        response.intent = ParsedIntent(
+                            apiProvider=_safe_get_source(valid_data),
+                            indicators=[d.metadata.indicator for d in valid_data if d.metadata],
+                            parameters={},
+                            clarificationNeeded=False,
+                            originalQuery=query,
+                        )
+
+                if data:
+                    clarification_response = self._build_uncertain_result_clarification(
+                        conversation_id=conversation_id,
+                        query=query,
+                        intent=response.intent,
+                        data=data,
+                        processing_steps=tracker.to_list() if tracker else None,
+                    )
+                    if clarification_response:
+                        return clarification_response
+
                 return response
             else:
                 error_msg = result.get("error", "Unknown error")
@@ -2900,6 +3575,39 @@ class QueryService:
         Returns:
             True if Deep Agents should be used
         """
+        query_lower = query.lower()
+
+        # Framework guardrail: keep single-metric retrieval queries on the
+        # deterministic path. Deep planning is most useful for true multi-step
+        # analysis, and can over-decompose straightforward ratio/flow requests.
+        ratio_patterns = [
+            "% of gdp", "as % of gdp", "as percent of gdp", "as percentage of gdp",
+            "share of gdp", "to gdp ratio", "ratio to gdp", "as share of gdp",
+        ]
+        analysis_keywords = [
+            "correlation", "regression", "causal", "simulate", "scenario",
+            "what if", "decompose", "optimize", "compute", "calculate", "derive",
+        ]
+        has_ratio_query = any(pattern in query_lower for pattern in ratio_patterns)
+        has_analysis_keyword = any(term in query_lower for term in analysis_keywords)
+        query_cues = self._extract_indicator_cues(query_lower)
+
+        if has_ratio_query and not has_analysis_keyword:
+            logger.info("⏭️ Deep Agents skipped for single-metric ratio retrieval query")
+            return False
+
+        if ("trade" in query_lower or "import" in query_lower or "export" in query_lower) and not has_analysis_keyword:
+            if not any(term in query_lower for term in ["correlation", "versus and", "decompose", "optimize"]):
+                logger.info("⏭️ Deep Agents skipped for direct trade retrieval query")
+                return False
+
+        if any(term in query_lower for term in ["rank", "ranking", "top ", "highest", "lowest"]):
+            # Ranking by a single indicator is a data retrieval + sort problem, not
+            # necessarily a multi-agent planning problem.
+            if len(query_cues) <= 2 and not has_analysis_keyword:
+                logger.info("⏭️ Deep Agents skipped for single-indicator ranking query")
+                return False
+
         # Use QueryComplexityAnalyzer for comprehensive detection
         complexity = QueryComplexityAnalyzer.detect_complexity(query)
 
@@ -3046,6 +3754,7 @@ class QueryService:
 
                 # Filter any remaining None values
                 data = _filter_valid_data(data)
+                data = self._rerank_data_by_query_relevance(query, data)
 
                 todos = result.get("todos", [])
                 message = None
@@ -3084,6 +3793,15 @@ class QueryService:
                         clarificationNeeded=False,
                         recommendedChartType="line",
                     )
+
+                clarification_response = self._build_uncertain_result_clarification(
+                    conversation_id=conversation_id,
+                    query=query,
+                    intent=intent,
+                    data=data,
+                )
+                if clarification_response:
+                    return clarification_response
 
                 return QueryResponse(
                     conversationId=conversation_id,
@@ -3307,6 +4025,8 @@ class QueryService:
             # Handle standard data result
             query_result = result.get("result", {})
             data = query_result.get("data", [])
+            if isinstance(data, list) and data:
+                data = self._rerank_data_by_query_relevance(query, data)
 
             # Guardrail: if LangGraph returns data whose semantic cues do not
             # match high-signal cues from the original query (e.g., import vs debt),
@@ -3457,6 +4177,16 @@ class QueryService:
                         originalQuery=query,
                     )
 
+                clarification_response = self._build_uncertain_result_clarification(
+                    conversation_id=conversation_id,
+                    query=query,
+                    intent=response.intent,
+                    data=data,
+                    processing_steps=tracker.to_list() if tracker else None,
+                )
+                if clarification_response:
+                    return clarification_response
+
             # If research query, add message
             if result.get("query_type") == "research":
                 response.message = query_result.get("message", "")
@@ -3526,6 +4256,16 @@ class QueryService:
             max_attempts=3,
             initial_delay=1.0,
         )
+        data = self._rerank_data_by_query_relevance(query, data)
+        clarification_response = self._build_uncertain_result_clarification(
+            conversation_id=conversation_id,
+            query=query,
+            intent=intent,
+            data=data,
+            processing_steps=tracker.to_list() if tracker else None,
+        )
+        if clarification_response:
+            return clarification_response
 
         conversation_manager.add_message_safe(
             conversation_id,
