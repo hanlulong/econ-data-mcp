@@ -223,6 +223,39 @@ class IndicatorResolverTests(unittest.TestCase):
         self.assertEqual(result.code, "RSAFS")
         self.assertEqual(result.source, "catalog")
 
+    def test_resolves_wages_query_via_catalog(self):
+        lookup = _FakeLookup(search_results=[])
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("average wages and earnings trend", provider="FRED", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "CES0500000003")
+        self.assertEqual(result.source, "catalog")
+
+    def test_prefers_dynamic_catalog_for_generic_coingecko_market_queries(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "capo-was-right",
+                    "provider": "CoinGecko",
+                    "name": "Capo Was Right",
+                    "description": "Low-cap token",
+                }
+            ]
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve(
+            "Top 10 cryptocurrencies by market cap right now",
+            provider="COINGECKO",
+            use_cache=False,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result.code).lower(), "dynamic")
+        self.assertEqual(result.source, "catalog")
+
     def test_resolves_debt_service_ratio_to_bis_catalog_code(self):
         lookup = _FakeLookup(search_results=[])
         resolver = IndicatorResolver(lookup=lookup, translator=IndicatorTranslator())
@@ -232,6 +265,16 @@ class IndicatorResolverTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.code, "WS_DSR")
         self.assertIn(result.source, {"catalog", "translator"})
+
+    def test_resolves_fiscal_deficit_to_imf_catalog_code(self):
+        lookup = _FakeLookup(search_results=[])
+        resolver = IndicatorResolver(lookup=lookup, translator=IndicatorTranslator())
+
+        result = resolver.resolve("fiscal deficit", provider="IMF", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "GGXCNL_NGDP")
+        self.assertEqual(result.source, "catalog")
 
     def test_money_aggregate_scoring_prefers_requested_aggregate(self):
         lookup = _FakeLookup(

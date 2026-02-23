@@ -29,7 +29,7 @@ explicit_exclusions:
 providers:
   IMF:
     primary:
-      code: GGXONLB_NGDP
+      code: GGXCNL_NGDP
       name: "General government net lending/borrowing (% of GDP)"
       confidence: 0.95
       coverage: global

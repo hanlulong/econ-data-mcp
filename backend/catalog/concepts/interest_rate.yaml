@@ -11,11 +11,15 @@ synonyms:
   primary:
     - policy rate
     - central bank rate
+    - federal funds rate
+    - federal funds target rate
   secondary:
     - benchmark rate
     - base rate
     - key rate
     - overnight rate
+    - policy target rate
+    - central bank target rate
 
 explicit_exclusions:
   - mortgage rate

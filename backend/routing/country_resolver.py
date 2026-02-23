@@ -395,6 +395,19 @@ class CountryResolver:
         # Libya, Nigeria, Saudi Arabia, UAE, Venezuela
     })
 
+    # Broader energy-exporting economies (includes major non-OPEC exporters)
+    ENERGY_EXPORTERS_MEMBERS: FrozenSet[str] = frozenset({
+        "DZ", "AO", "AR", "AU", "BR", "CA", "CG", "GQ", "GA", "IR",
+        "IQ", "KW", "LY", "MX", "NG", "NO", "QA", "RU", "SA", "AE",
+        "US", "VE",
+    })
+
+    # Major energy-importing economies (oil/gas net importers)
+    ENERGY_IMPORTERS_MEMBERS: FrozenSet[str] = frozenset({
+        "BD", "CN", "DE", "ES", "FR", "IN", "IT", "JP", "KR", "PH",
+        "PK", "TH", "TR", "VN",
+    })
+
     # MERCOSUR - Southern Common Market (infrastructure fix for session 11)
     MERCOSUR_MEMBERS: FrozenSet[str] = frozenset({
         "AR", "BR", "PY", "UY",  # Full members: Argentina, Brazil, Paraguay, Uruguay
@@ -868,6 +881,15 @@ class CountryResolver:
             "OPEC_COUNTRIES": cls.OPEC_MEMBERS,
             "OPEC_MEMBERS": cls.OPEC_MEMBERS,
             "OPEC_NATIONS": cls.OPEC_MEMBERS,
+            # Energy importer/exporter macro groups
+            "ENERGY_EXPORTERS": cls.ENERGY_EXPORTERS_MEMBERS,
+            "ENERGY_EXPORTING_COUNTRIES": cls.ENERGY_EXPORTERS_MEMBERS,
+            "NET_ENERGY_EXPORTERS": cls.ENERGY_EXPORTERS_MEMBERS,
+            "OIL_EXPORTERS": cls.ENERGY_EXPORTERS_MEMBERS,
+            "ENERGY_IMPORTERS": cls.ENERGY_IMPORTERS_MEMBERS,
+            "ENERGY_IMPORTING_COUNTRIES": cls.ENERGY_IMPORTERS_MEMBERS,
+            "NET_ENERGY_IMPORTERS": cls.ENERGY_IMPORTERS_MEMBERS,
+            "OIL_IMPORTERS": cls.ENERGY_IMPORTERS_MEMBERS,
             # MERCOSUR - Southern Common Market (infrastructure fix session 11)
             "MERCOSUR": cls.MERCOSUR_MEMBERS,
             "MERCOSUR_COUNTRIES": cls.MERCOSUR_MEMBERS,
@@ -893,11 +915,10 @@ class CountryResolver:
             # Visegrad typo handling
             "VISEGARD": cls.VISEGRAD_MEMBERS,
             "VISEGARD_GROUP": cls.VISEGRAD_MEMBERS,
-            "OIL_EXPORTERS": cls.OPEC_MEMBERS,
         }
 
         if region_upper in REGION_MAPPINGS:
-            return list(REGION_MAPPINGS[region_upper])
+            return sorted(REGION_MAPPINGS[region_upper])
 
         return None
 
@@ -930,6 +951,19 @@ class CountryResolver:
 
         query_lower = query.lower()
         detected = []
+
+        def _contains_region_phrase(phrase: str) -> bool:
+            """
+            Robust phrase matching with token boundaries.
+
+            Prevents accidental substring hits (e.g., short region keys inside
+            unrelated words) while still allowing spaces/hyphens between words.
+            """
+            escaped = re.escape(str(phrase or "").strip().lower())
+            if not escaped:
+                return False
+            escaped = escaped.replace(r"\ ", r"[\s\-]+")
+            return re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", query_lower) is not None
 
         # Region patterns to check (ordered by specificity)
         region_patterns = [
@@ -1067,17 +1101,24 @@ class CountryResolver:
             ("opec nations", "OPEC"),
             ("opec members", "OPEC"),
             ("opec", "OPEC"),
-            ("oil exporters", "OPEC"),
+            # Energy importers/exporters (for macro group comparisons)
+            ("energy importers", "ENERGY_IMPORTERS"),
+            ("energy importing countries", "ENERGY_IMPORTERS"),
+            ("net energy importers", "ENERGY_IMPORTERS"),
+            ("oil importers", "ENERGY_IMPORTERS"),
+            ("energy exporters", "ENERGY_EXPORTERS"),
+            ("energy exporting countries", "ENERGY_EXPORTERS"),
+            ("net energy exporters", "ENERGY_EXPORTERS"),
+            ("oil exporters", "ENERGY_EXPORTERS"),
             # EU needs word boundary check to avoid matching "euro" or "neutral"
         ]
 
         # Special handling for "eu" - need word boundary to avoid false matches
-        import re
         if re.search(r'\beu\b', query_lower) and "EU" not in detected:
             detected.append("EU")
 
         for pattern, region_name in region_patterns:
-            if pattern in query_lower and region_name not in detected:
+            if _contains_region_phrase(pattern) and region_name not in detected:
                 detected.append(region_name)
 
         return detected
@@ -1097,14 +1138,18 @@ class CountryResolver:
             List of all country ISO codes from detected regions (deduplicated)
         """
         regions = cls.detect_regions_in_query(query)
-        all_countries: Set[str] = set()
+        all_countries: List[str] = []
+        seen: Set[str] = set()
 
         for region in regions:
             expanded = cls.expand_region(region)
             if expanded:
-                all_countries.update(expanded)
+                for code in expanded:
+                    if code not in seen:
+                        seen.add(code)
+                        all_countries.append(code)
 
-        return list(all_countries)
+        return all_countries
 
     # ==========================================================================
     # ISO Code Conversion Utilities

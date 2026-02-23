@@ -15,10 +15,11 @@ synonyms:
     - new residential construction
     - new housing construction
     - home construction starts
+    - housing starts and building permits
+    - residential building permits
 
 explicit_exclusions:
   - home prices
-  - building permits
   - mortgage rates
   - housing affordability
 

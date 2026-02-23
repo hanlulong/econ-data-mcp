@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from backend.models import GeneratedFile, NormalizedData, ParsedIntent
+from backend.models import GeneratedFile, NormalizedData, ParsedIntent, QueryResponse
 from backend.routing.unified_router import RoutingDecision
 from backend.services.cache import cache_service
 from backend.services.query import QueryService
@@ -144,6 +144,18 @@ class QueryServiceTests(unittest.TestCase):
         intent = ParsedIntent(
             apiProvider="World Bank",
             indicators=["Gross PSD, Central Gov., All maturities, % of GDP"],
+            parameters={"countries": ["China", "US"]},
+            clarificationNeeded=False,
+            originalQuery="import share of gdp China and US",
+        )
+
+        selected = self.service._select_indicator_query_for_resolution(intent)  # pylint: disable=protected-access
+        self.assertEqual(selected, "import share of gdp China and US")
+
+    def test_select_indicator_query_uses_original_when_only_generic_gdp_overlap_exists(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="World Bank",
+            indicators=["Gross domestic savings (% of GDP)"],
             parameters={"countries": ["China", "US"]},
             clarificationNeeded=False,
             originalQuery="import share of gdp China and US",
@@ -335,6 +347,30 @@ class QueryServiceTests(unittest.TestCase):
         self.assertNotEqual(bis_series.metadata.indicator, "WS_DSR")
         self.assertIn("debt service", bis_series.metadata.indicator.lower())
 
+    def test_normalize_metadata_labels_promotes_description_for_code_like_indicator(self) -> None:
+        imf_series = NormalizedData.model_validate(
+            {
+                "metadata": {
+                    "source": "IMF",
+                    "indicator": "GGXCNL_NGDP",
+                    "country": "CN",
+                    "frequency": "annual",
+                    "unit": "percent",
+                    "lastUpdated": "",
+                    "seriesId": "GGXCNL_NGDP",
+                    "description": "General government net lending/borrowing (% of GDP)",
+                },
+                "data": [{"date": "2020-01-01", "value": -2.1}],
+            }
+        )
+
+        self.service._normalize_bis_metadata_labels([imf_series])  # pylint: disable=protected-access
+
+        self.assertEqual(
+            imf_series.metadata.indicator,
+            "General government net lending/borrowing (% of GDP)",
+        )
+
     def test_has_implausible_top_series_detects_wrong_fred_tenor(self) -> None:
         wrong_series = NormalizedData.model_validate(
             {
@@ -420,6 +456,82 @@ class QueryServiceTests(unittest.TestCase):
         self.assertIn("IMF", joined)
         self.assertIn("WorldBank", joined)
 
+    def test_needs_indicator_clarification_detects_catalog_concept_mismatch(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="WorldBank",
+            indicators=["imports as % of GDP"],
+            parameters={"countries": ["CN", "US"]},
+            clarificationNeeded=False,
+            originalQuery="import share of gdp in china and us",
+        )
+        mismatched_series = [
+            NormalizedData.model_validate(
+                {
+                    "metadata": {
+                        "source": "WorldBank",
+                        "indicator": "Gross savings (% of GDP)",
+                        "country": "CN",
+                        "frequency": "annual",
+                        "unit": "%",
+                        "lastUpdated": "",
+                        "seriesId": "NY.GNS.ICTR.ZS",
+                    },
+                    "data": [{"date": "2020-01-01", "value": 44.0}],
+                }
+            )
+        ]
+
+        needs = self.service._needs_indicator_clarification(  # pylint: disable=protected-access
+            query="import share of gdp in china and us",
+            data=mismatched_series,
+            intent=intent,
+        )
+        self.assertTrue(needs)
+
+    def test_build_multi_concept_query_clarification_for_single_indicator_parse(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="IMF",
+            indicators=["inflation"],
+            parameters={"countries": ["US", "GB"]},
+            clarificationNeeded=False,
+            originalQuery="compare unemployment and inflation for g7 countries from 2010 to 2024",
+        )
+
+        clarification = self.service._build_multi_concept_query_clarification(  # pylint: disable=protected-access
+            conversation_id="conv-multi",
+            query=intent.originalQuery,
+            intent=intent,
+            is_multi_indicator=False,
+            processing_steps=None,
+        )
+
+        self.assertIsNotNone(clarification)
+        assert clarification is not None
+        self.assertTrue(clarification.clarificationNeeded)
+        joined = "\n".join(clarification.clarificationQuestions or []).lower()
+        self.assertIn("multiple indicator families", joined)
+        self.assertIn("labor market", joined)
+        self.assertIn("prices/inflation", joined)
+
+    def test_build_multi_concept_query_clarification_skips_trade_openness_phrasing(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="WorldBank",
+            indicators=["trade openness"],
+            parameters={"country": "SG"},
+            clarificationNeeded=False,
+            originalQuery="trade openness ratio (exports plus imports to gdp) in singapore",
+        )
+
+        clarification = self.service._build_multi_concept_query_clarification(  # pylint: disable=protected-access
+            conversation_id="conv-openness",
+            query=intent.originalQuery,
+            intent=intent,
+            is_multi_indicator=False,
+            processing_steps=None,
+        )
+
+        self.assertIsNone(clarification)
+
     def test_collect_indicator_choice_options_prefers_raw_query_on_cue_mismatch(self) -> None:
         intent = ParsedIntent(
             apiProvider="WorldBank",
@@ -491,6 +603,45 @@ class QueryServiceTests(unittest.TestCase):
             run(self.service._fetch_data(intent))  # pylint: disable=protected-access
 
         self.assertEqual(fetch_mock.call_args.kwargs.get("indicator"), "LFS_UNEM_A")
+
+    def test_imf_fetch_prefers_resolved_indicator_param_for_multi_country_batch(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="IMF",
+            indicators=["government deficit as % of gdp", "fiscal balance"],
+            parameters={
+                "countries": ["China", "Brazil"],
+                "indicator": "GGXCNL_NGDP",
+                "startDate": "2015-01-01",
+                "endDate": "2024-01-01",
+            },
+            clarificationNeeded=False,
+            originalQuery="from imf government deficit share of gdp in china and brazil",
+        )
+
+        with patch.object(self.service, "_get_from_cache", return_value=None), \
+             patch.object(self.service.imf_provider, "_resolve_countries", side_effect=lambda x: [str(x).upper()]), \
+             patch.object(self.service.imf_provider, "fetch_batch_indicator", new_callable=AsyncMock, return_value=[sample_series()]) as fetch_mock:
+            run(self.service._fetch_data(intent))  # pylint: disable=protected-access
+
+        self.assertEqual(fetch_mock.await_count, 1)
+        self.assertEqual(fetch_mock.await_args.kwargs.get("indicator"), "GGXCNL_NGDP")
+
+    def test_fetch_data_concept_override_prefers_stronger_provider_match(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="IMF",
+            indicators=["REAL_EFFECTIVE_EXCHANGE_RATE"],
+            parameters={"country": "JP"},
+            clarificationNeeded=False,
+            originalQuery="real effective exchange rate in japan",
+        )
+
+        with patch.object(self.service, "_get_from_cache", return_value=None), \
+             patch.object(self.service.bis_provider, "fetch_indicator", return_value=[sample_series()]) as bis_fetch, \
+             patch.object(self.service.imf_provider, "fetch_indicator", side_effect=AssertionError("should reroute before IMF fetch")):
+            run(self.service._fetch_data(intent))  # pylint: disable=protected-access
+
+        self.assertTrue(bis_fetch.called)
+        self.assertEqual(bis_fetch.call_args.kwargs.get("indicator"), "WS_XRU")
 
     def test_process_query_enforces_explicit_provider_request(self) -> None:
         intent = ParsedIntent(
@@ -738,8 +889,32 @@ class QueryServiceTests(unittest.TestCase):
             def update(self, *_args, **_kwargs):
                 return None
 
-        with patch("backend.agents.get_agent_graph", return_value=_FakeGraph()), \
-             patch("backend.agents.set_query_service_provider"), \
+        import sys
+        import types
+
+        fake_agents_module = types.ModuleType("backend.agents")
+        fake_agents_module.get_agent_graph = lambda: _FakeGraph()
+        fake_agents_module.set_query_service_provider = lambda _provider=None: None
+
+        fake_messages_module = types.ModuleType("langchain_core.messages")
+
+        class _Message:
+            def __init__(self, content: str = ""):
+                self.content = content
+
+        fake_messages_module.HumanMessage = _Message
+        fake_messages_module.AIMessage = _Message
+        fake_langchain_core = types.ModuleType("langchain_core")
+        fake_langchain_core.messages = fake_messages_module
+
+        with patch.dict(
+            sys.modules,
+            {
+                "backend.agents": fake_agents_module,
+                "langchain_core": fake_langchain_core,
+                "langchain_core.messages": fake_messages_module,
+            },
+        ), \
              patch("backend.memory.state_manager.get_state_manager", return_value=_FakeStateManager()):
             response = run(
                 self.service._execute_with_langgraph(  # pylint: disable=protected-access
@@ -754,6 +929,93 @@ class QueryServiceTests(unittest.TestCase):
         self.assertIsNotNone(response.codeExecution)
         assert response.codeExecution is not None
         self.assertEqual(response.codeExecution.files[0].name, "report.png")
+
+    def test_execute_with_langgraph_retries_standard_path_when_empty_result_lacks_intent(self) -> None:
+        class _FakeGraph:
+            async def ainvoke(self, _initial_state, _config):
+                return {
+                    "result": {"data": []},
+                    "parsed_intent": None,
+                    "current_provider": "unknown",
+                }
+
+        class _FakeStateManager:
+            def get(self, _conversation_id):
+                return None
+
+            def update(self, *_args, **_kwargs):
+                return None
+
+        standard_response = QueryResponse(
+            conversationId="conv-lg-empty",
+            clarificationNeeded=False,
+            data=[sample_series()],
+        )
+
+        import sys
+        import types
+
+        fake_agents_module = types.ModuleType("backend.agents")
+        fake_agents_module.get_agent_graph = lambda: _FakeGraph()
+        fake_agents_module.set_query_service_provider = lambda _provider=None: None
+
+        fake_messages_module = types.ModuleType("langchain_core.messages")
+
+        class _Message:
+            def __init__(self, content: str = ""):
+                self.content = content
+
+        fake_messages_module.HumanMessage = _Message
+        fake_messages_module.AIMessage = _Message
+        fake_langchain_core = types.ModuleType("langchain_core")
+        fake_langchain_core.messages = fake_messages_module
+
+        with patch.dict(
+            sys.modules,
+            {
+                "backend.agents": fake_agents_module,
+                "langchain_core": fake_langchain_core,
+                "langchain_core.messages": fake_messages_module,
+            },
+        ), \
+             patch("backend.memory.state_manager.get_state_manager", return_value=_FakeStateManager()), \
+             patch.object(self.service, "_standard_query_processing", new_callable=AsyncMock, return_value=standard_response) as standard_mock:
+            response = run(
+                self.service._execute_with_langgraph(  # pylint: disable=protected-access
+                    query="which asean country has highest import share of gdp since 2015",
+                    conversation_id="conv-lg-empty",
+                    conversation_history=[],
+                    tracker=None,
+                )
+            )
+
+        self.assertEqual(len(response.data or []), 1)
+        standard_mock.assert_awaited_once()
+
+    def test_process_query_tries_fallback_when_primary_returns_empty_data(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="IMF",
+            indicators=["imports share of gdp"],
+            parameters={"country": "CN"},
+            clarificationNeeded=False,
+            originalQuery="imports share of gdp in china",
+        )
+
+        class _Settings:
+            use_langchain_orchestrator = False
+
+        with patch("backend.config.get_settings", return_value=_Settings()), \
+             patch.object(self.service.openrouter, "parse_query", return_value=intent), \
+             patch("backend.services.query.QueryComplexityAnalyzer.detect_complexity", return_value={"pro_mode_required": False, "complexity_factors": []}), \
+             patch("backend.services.query.ParameterValidator.validate_intent", return_value=(True, None, None)), \
+             patch("backend.services.query.ParameterValidator.check_confidence", return_value=(True, None)), \
+             patch.object(self.service, "_fetch_data", return_value=[]), \
+             patch.object(self.service, "_try_with_fallback", return_value=[sample_series()]) as fallback_mock:
+            response = run(self.service.process_query("imports share of gdp in china", auto_pro_mode=False))
+
+        self.assertIsNone(response.error)
+        self.assertEqual(len(response.data or []), 1)
+        self.assertTrue(fallback_mock.called)
 
     def test_fetch_data_coingecko_normalizes_empty_coin_ids_and_vs_currency(self) -> None:
         intent = ParsedIntent(
@@ -770,6 +1032,24 @@ class QueryServiceTests(unittest.TestCase):
 
         self.assertTrue(range_mock.called)
         self.assertEqual(range_mock.call_args.kwargs.get("vs_currency"), "usd")
+
+    def test_fetch_data_coingecko_uses_query_text_for_coin_and_metric_when_indicator_is_dynamic(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="CoinGecko",
+            indicators=["dynamic"],
+            parameters={},
+            clarificationNeeded=False,
+            originalQuery="solana trading volume over the last 90 days",
+        )
+
+        with patch.object(self.service, "_get_from_cache", return_value=None), \
+             patch.object(self.service.coingecko_provider, "get_historical_data", return_value=[sample_series()]) as historical_mock:
+            run(self.service._fetch_data(intent))  # pylint: disable=protected-access
+
+        self.assertTrue(historical_mock.called)
+        self.assertEqual(historical_mock.call_args.kwargs.get("coin_id"), "solana")
+        self.assertEqual(historical_mock.call_args.kwargs.get("metric"), "volume")
+        self.assertEqual(historical_mock.call_args.kwargs.get("days"), 90)
 
 
 if __name__ == "__main__":

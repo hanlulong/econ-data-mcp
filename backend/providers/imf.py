@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, TYPE_CHECKING
 import asyncio
 import logging
+import re
 
 import httpx
 
@@ -602,6 +603,41 @@ class IMFProvider(BaseProvider):
 
         return None
 
+    @staticmethod
+    def _looks_like_imf_code(indicator: str) -> bool:
+        """Heuristic check for IMF code-like indicator strings."""
+        token = str(indicator or "").strip().upper()
+        return bool(token and re.fullmatch(r"[A-Z][A-Z0-9_]{2,32}", token))
+
+    def _friendly_indicator_label(self, requested_indicator: str, indicator_code: str) -> str:
+        """
+        Resolve a human-readable indicator label when the request is code-like.
+        """
+        requested = str(requested_indicator or "").strip()
+        if requested and not self._looks_like_imf_code(requested):
+            return requested
+
+        try:
+            from ..services.catalog_service import find_concepts_by_code, get_provider_info
+
+            concepts = find_concepts_by_code("IMF", indicator_code)
+            for concept in concepts:
+                provider_info = get_provider_info(concept, "IMF") or {}
+                primary = provider_info.get("primary", {})
+                if isinstance(primary, dict):
+                    label = str(primary.get("name") or "").strip()
+                    if label:
+                        return label
+        except Exception as exc:
+            logger.debug(
+                "Could not resolve friendly IMF label for %s (%s): %s",
+                indicator_code,
+                requested_indicator,
+                exc,
+            )
+
+        return indicator_code
+
     def _resolve_countries(self, country_or_region: str) -> List[str]:
         """Resolve country/region to list of IMF country codes.
 
@@ -953,14 +989,15 @@ class IMFProvider(BaseProvider):
         # Step 1: Try direct mapping
         mapped = self._indicator_code(indicator)
         if mapped:
-            return mapped, indicator
+            return mapped, self._friendly_indicator_label(indicator, mapped)
 
         # Step 2: Try cross-provider indicator translator (handles indicator names from other systems)
         translator = get_indicator_translator()
         translated_code, concept_name = translator.translate_indicator(indicator, "IMF")
         if translated_code:
             logger.info(f"IMF: Translated '{indicator}' to '{translated_code}' via concept '{concept_name}'")
-            return translated_code, concept_name
+            label_hint = concept_name or indicator
+            return translated_code, self._friendly_indicator_label(label_hint, translated_code)
 
         # Note: We used to allow raw IMF codes without validation (if uppercase + underscore),
         # but this led to errors when LLMs generated fake codes like "CORPORATE_DEBT".

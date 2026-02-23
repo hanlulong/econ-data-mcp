@@ -1,0 +1,44 @@
+# Wages / Earnings Indicator Catalog
+concept: wages
+category: labor_market
+domain: macroeconomics
+
+description: |
+  Compensation paid to employees, often tracked through average earnings
+  and wage indexes over time.
+
+synonyms:
+  primary:
+    - wages
+    - earnings
+    - average hourly earnings
+    - wage growth
+  secondary:
+    - salary growth
+    - pay growth
+    - labor earnings
+    - compensation trend
+
+explicit_exclusions:
+  - minimum wage law
+  - household income
+  - labor productivity
+
+providers:
+  FRED:
+    primary:
+      code: CES0500000003
+      name: "Average Hourly Earnings of All Employees, Private Nonfarm"
+      confidence: 0.90
+      coverage: [US]
+      frequency: monthly
+
+not_available:
+  - WorldBank
+  - IMF
+  - Eurostat
+  - BIS
+  - Comtrade
+  - ExchangeRate
+  - CoinGecko
+  - StatsCan

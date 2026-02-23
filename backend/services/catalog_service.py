@@ -18,6 +18,7 @@ Key responsibilities:
 """
 from typing import Dict, List, Optional, Any, Tuple, Set
 import logging
+import re
 from pathlib import Path
 import yaml
 
@@ -121,14 +122,37 @@ def find_concept_by_term(term: str) -> Optional[str]:
             return concept_name
 
     # 2) Semantic phrase/token pass for longer natural-language terms.
-    # Keeps precision by requiring meaningful overlap with known synonyms.
-    term_tokens = {
-        token
-        for token in term_lower.replace("_", " ").split()
-        if len(token) > 2
+    # Keeps precision by requiring meaningful overlap with known synonyms,
+    # while also handling typo/plural variants in a generic way.
+    term_corrections = {
+        "ration": "ratio",
+        "exprot": "export",
+        "exprt": "export",
+        "improt": "import",
+        "imprt": "import",
+        "savngs": "savings",
     }
+
+    def _tokenize(text: str) -> Set[str]:
+        raw_tokens = re.findall(r"[a-z0-9]+", str(text or "").lower().replace("_", " "))
+        tokens: Set[str] = set()
+        for token in raw_tokens:
+            token = term_corrections.get(token, token)
+            if len(token) <= 1:
+                continue
+            tokens.add(token)
+            if token.endswith("ies") and len(token) > 4:
+                tokens.add(token[:-3] + "y")
+            elif token.endswith("s") and len(token) > 3:
+                tokens.add(token[:-1])
+        return tokens
+
+    term_tokens = _tokenize(term_lower)
     if not term_tokens:
         return None
+
+    term_has_import = bool({"import", "imports"} & term_tokens)
+    term_has_export = bool({"export", "exports"} & term_tokens)
 
     best_concept: Optional[str] = None
     best_score = 0.0
@@ -153,17 +177,38 @@ def find_concept_by_term(term: str) -> Optional[str]:
                 concept_score = max(concept_score, 0.95)
                 continue
 
-            candidate_tokens = {
-                token
-                for token in candidate_lower.replace("_", " ").split()
-                if len(token) > 2
-            }
+            candidate_tokens = _tokenize(candidate_lower)
             if not candidate_tokens:
                 continue
 
+            candidate_score = 0.0
             overlap = len(term_tokens & candidate_tokens) / max(len(candidate_tokens), 1)
-            if len(candidate_tokens) >= 2 and overlap >= 0.75:
-                concept_score = max(concept_score, min(0.92, 0.60 + 0.40 * overlap))
+            if len(candidate_tokens) >= 2 and overlap >= 0.60:
+                candidate_score = max(candidate_score, min(0.92, 0.56 + 0.40 * overlap))
+            elif len(candidate_tokens) == 1 and overlap >= 1.0:
+                candidate_score = max(candidate_score, 0.84)
+
+            candidate_has_import = bool({"import", "imports"} & candidate_tokens)
+            candidate_has_export = bool({"export", "exports"} & candidate_tokens)
+
+            # Directional guardrails: import/export intent should strongly favor
+            # same-direction concepts and penalize opposite/neutral concepts.
+            if term_has_import:
+                if candidate_has_import:
+                    candidate_score += 0.10
+                elif candidate_has_export:
+                    candidate_score -= 0.35
+                else:
+                    candidate_score -= 0.12
+            if term_has_export:
+                if candidate_has_export:
+                    candidate_score += 0.10
+                elif candidate_has_import:
+                    candidate_score -= 0.35
+                else:
+                    candidate_score -= 0.12
+
+            concept_score = max(concept_score, candidate_score)
 
         if concept_score > best_score:
             best_score = concept_score
@@ -197,7 +242,15 @@ def is_excluded_term(term: str, concept_name: str) -> bool:
     term_lower = term.lower()
 
     for exclusion in exclusions:
-        if exclusion.lower() in term_lower:
+        exclusion_text = str(exclusion or "").strip().lower()
+        if not exclusion_text:
+            continue
+
+        # Boundary-aware phrase match avoids false positives where exclusion
+        # text is only a substring of the intended concept (e.g., employment
+        # inside unemployment).
+        escaped = re.escape(exclusion_text).replace(r"\ ", r"[\s\-]+")
+        if re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", term_lower):
             return True
 
     return False
@@ -391,18 +444,43 @@ def _check_coverage(coverage: Any, countries: Optional[List[str]]) -> bool:
     if not countries:
         return True
 
-    if coverage == "global":
+    def _to_iso2(country: str) -> Optional[str]:
+        if not country:
+            return None
+        normalized = CountryResolver.normalize(country)
+        if normalized:
+            return normalized
+        return CountryResolver.to_iso2(str(country).upper())
+
+    if isinstance(coverage, str):
+        # Strip inline comments in YAML values like "OECD  # ...".
+        coverage_normalized = coverage.split("#", 1)[0].strip().lower()
+    else:
+        coverage_normalized = coverage
+
+    if coverage_normalized in {"global", "partial_global"}:
         return True
 
-    if coverage == "oecd_members":
+    if coverage_normalized in {"oecd_members", "oecd", "oecd_plus"}:
         return all(CountryResolver.is_oecd_member(c) for c in countries)
 
-    if coverage == "eu_members":
+    if coverage_normalized in {"eu_members", "eu"}:
         return all(CountryResolver.is_eu_member(c) for c in countries)
 
+    if coverage_normalized in {"us_only", "us"}:
+        return all((_to_iso2(c) or str(c).upper()) == "US" for c in countries)
+
+    if coverage_normalized == "44_countries":
+        try:
+            from ..providers.bis import BISProvider
+            return all((_to_iso2(c) or str(c).upper()) in BISProvider.BIS_SUPPORTED_COUNTRIES for c in countries)
+        except Exception:
+            # Fail open for coverage hints when BIS module is unavailable.
+            return True
+
     if isinstance(coverage, list):
-        coverage_upper = {c.upper() for c in coverage}
-        return all(c.upper() in coverage_upper for c in countries)
+        coverage_upper = {(CountryResolver.normalize(c) or str(c).upper()) for c in coverage}
+        return all((CountryResolver.normalize(c) or str(c).upper()) in coverage_upper for c in countries)
 
     return False
 

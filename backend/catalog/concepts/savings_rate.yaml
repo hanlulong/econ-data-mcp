@@ -23,6 +23,11 @@ explicit_exclusions:
   - gross domestic savings
   - personal savings rate
   - savings deposits
+  - imports
+  - import share
+  - exports
+  - export share
+  - trade share
 
 providers:
   WorldBank:

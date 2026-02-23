@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import json
+import re
 from typing import Dict, List, Optional, TYPE_CHECKING
 from pathlib import Path
 
@@ -411,32 +412,51 @@ class OECDProvider:
         Raises:
             DataNotAvailableError if no suitable dataflow found after all fallback attempts
         """
-        # STEP 1: Check cache first
-        cache_key = f"oecd_indicator:{indicator.upper()}"
-        cached = cache_service.get(cache_key)
-        if cached:
-            logger.info(f"🔄 Cache hit for OECD indicator: {indicator}")
-            return cached
+        lookup_terms = self._build_indicator_lookup_terms(indicator)
+        if not lookup_terms:
+            raise DataNotAvailableError("OECD indicator is empty")
 
-        logger.info(f"🔍 Resolving OECD indicator: {indicator} (cache miss)")
+        # STEP 1: Check cache first (for all lookup aliases)
+        cache_keys = [f"oecd_indicator:{term.upper()}" for term in lookup_terms]
+        for cache_key in cache_keys:
+            cached = cache_service.get(cache_key)
+            if cached:
+                logger.info(f"🔄 Cache hit for OECD indicator lookup key: {cache_key}")
+                return cached
+
+        logger.info(
+            "🔍 Resolving OECD indicator '%s' with lookup terms: %s",
+            indicator,
+            lookup_terms[:4],
+        )
 
         # STEP 2: Use metadata search if available (PRIMARY method)
         if self.metadata_search:
             try:
-                logger.info(f"📚 Searching OECD metadata catalog for indicator: {indicator}")
-                search_results = await self.metadata_search.search_with_sdmx_fallback(
-                    provider="OECD",
-                    indicator=indicator,
-                )
+                ambiguity_error: Optional[DataNotAvailableError] = None
+                for idx, lookup_term in enumerate(lookup_terms):
+                    logger.info(f"📚 Searching OECD metadata catalog for indicator: {lookup_term}")
+                    search_results = await self.metadata_search.search_with_sdmx_fallback(
+                        provider="OECD",
+                        indicator=lookup_term,
+                    )
 
-                if search_results:
-                    logger.info(f"✅ Found {len(search_results)} matching OECD dataflows for '{indicator}'")
+                    if not search_results:
+                        logger.warning(
+                            f"⚠️ No SDMX metadata found for '{lookup_term}'. "
+                            f"Trying next lookup alias."
+                        )
+                        continue
+
+                    logger.info(
+                        f"✅ Found {len(search_results)} matching OECD dataflows for '{lookup_term}'"
+                    )
 
                     # Use LLM to intelligently select the best match
-                    logger.info(f"🤖 Using LLM to select best matching dataflow for '{indicator}'")
+                    logger.info(f"🤖 Using LLM to select best matching dataflow for '{lookup_term}'")
                     discovery = await self.metadata_search.discover_indicator(
                         provider="OECD",
-                        indicator_name=indicator,
+                        indicator_name=lookup_term,
                         search_results=search_results,
                     )
 
@@ -446,10 +466,13 @@ class OECDProvider:
                         options_text = "\n".join([
                             f"  • {opt['name']}" for opt in options[:5]
                         ])
-                        raise DataNotAvailableError(
-                            f"Your query '{indicator}' matches multiple datasets. Please be more specific:\n{options_text}\n\n"
+                        ambiguity_error = DataNotAvailableError(
+                            f"Your query '{lookup_term}' matches multiple datasets. Please be more specific:\n{options_text}\n\n"
                             f"Try specifying the exact metric you need."
                         )
+                        if idx < len(lookup_terms) - 1:
+                            continue
+                        raise ambiguity_error
 
                     if discovery and discovery.get("code"):
                         confidence = discovery.get('confidence', 0)
@@ -464,24 +487,28 @@ class OECDProvider:
 
                             # Extract agency from structure/dataflow info
                             result = self._build_result_from_discovery(dataflow_code, discovery)
-                            cache_service.set(cache_key, result, ttl=86400)  # Cache 24h
-                            logger.info(f"✅ Resolved OECD indicator '{indicator}' → {result}")
-                            return result
-                        else:
-                            logger.warning(
-                                f"⚠️ LLM confidence too low for '{indicator}' "
-                                f"(confidence: {confidence} < 0.6). Falling back to catalog lookup."
+                            for cache_key in cache_keys:
+                                cache_service.set(cache_key, result, ttl=86400)  # Cache 24h
+                            logger.info(
+                                "✅ Resolved OECD indicator '%s' via lookup term '%s' → %s",
+                                indicator,
+                                lookup_term,
+                                result,
                             )
+                            return result
+
+                        logger.warning(
+                            f"⚠️ LLM confidence too low for '{lookup_term}' "
+                            f"(confidence: {confidence} < 0.6). Trying next lookup alias."
+                        )
                     else:
                         logger.warning(
-                            f"⚠️ LLM could not select a dataflow for '{indicator}'. "
-                            f"Falling back to catalog lookup."
+                            f"⚠️ LLM could not select a dataflow for '{lookup_term}'. "
+                            f"Trying next lookup alias."
                         )
-                else:
-                    logger.warning(
-                        f"⚠️ No SDMX metadata found for '{indicator}'. "
-                        f"Falling back to local catalog lookup."
-                    )
+
+                if ambiguity_error:
+                    raise ambiguity_error
 
             except Exception as e:
                 logger.warning(
@@ -500,9 +527,19 @@ class OECDProvider:
                     f"Please check that backend/data/metadata/sdmx/oecd_dataflows.json exists."
                 )
 
-            # Collect all matching candidates
+            # Use first human-readable lookup term for local lexical scoring.
+            # Metadata search already iterates aliases; catalog scoring works best
+            # with one focused phrase.
+            catalog_lookup_term = next(
+                (
+                    term for term in lookup_terms
+                    if not re.fullmatch(r"[A-Z][A-Z0-9_.-]{2,24}", term.upper())
+                ),
+                lookup_terms[0],
+            )
+
             candidates = []
-            indicator_lower = indicator.lower()
+            indicator_lower = catalog_lookup_term.lower()
             indicator_words = set(indicator_lower.replace("_", " ").split())
 
             for flow_id, flow_info in catalog.items():
@@ -760,7 +797,8 @@ class OECDProvider:
                 version = "1.0"
 
                 result = (agency, dataflow, version)
-                cache_service.set(cache_key, result, ttl=86400)  # Cache 24h
+                for cache_key in cache_keys:
+                    cache_service.set(cache_key, result, ttl=86400)  # Cache 24h
                 logger.info(
                     f"✅ Found OECD indicator '{indicator}' in local catalog → {dataflow} "
                     f"(priority-adjusted score: {best_score}, structure: {structure}, agency: {agency})"
@@ -780,6 +818,62 @@ class OECDProvider:
             f"Exports, Imports, Government Debt, Productivity, "
             f"Education Spending, Health Expenditure"
         )
+
+    def _build_indicator_lookup_terms(self, indicator: str) -> List[str]:
+        """
+        Build ordered lookup aliases for OECD indicator discovery.
+
+        This improves code-like inputs (e.g., IRLT) by expanding them into
+        human-readable concept labels before metadata search.
+        """
+        raw = str(indicator or "").strip()
+        if not raw:
+            return []
+
+        terms: List[str] = [raw]
+        compact = raw.replace("_", " ").strip()
+        if compact and compact.lower() != raw.lower():
+            terms.append(compact)
+
+        upper = raw.upper()
+        code_like = bool(re.fullmatch(r"[A-Z][A-Z0-9_.-]{2,24}", upper))
+        is_dataflow_code = "@" in upper or upper.startswith("DSD_") or upper.startswith("DF_")
+
+        if code_like and not is_dataflow_code and " " not in raw:
+            try:
+                from ..services.catalog_service import (
+                    find_concepts_by_code,
+                    get_all_synonyms,
+                    get_provider_info,
+                )
+
+                concepts = find_concepts_by_code("OECD", upper)
+                for concept in concepts:
+                    provider_info = get_provider_info(concept, "OECD") or {}
+                    primary = provider_info.get("primary", {})
+                    if isinstance(primary, dict):
+                        primary_name = str(primary.get("name") or "").strip()
+                        if primary_name:
+                            terms.append(primary_name)
+
+                    # Add a few synonyms as backup search terms.
+                    for synonym in get_all_synonyms(concept)[:3]:
+                        synonym_text = str(synonym or "").strip()
+                        if synonym_text:
+                            terms.append(synonym_text)
+            except Exception as exc:
+                logger.debug("OECD indicator alias expansion skipped for '%s': %s", indicator, exc)
+
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            normalized = str(term or "").strip()
+            key = normalized.lower()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(normalized)
+        return deduped[:6]
 
     def _build_result_from_discovery(self, dataflow_code: str, discovery: dict) -> tuple[str, str, str]:
         """Build the final result tuple from LLM discovery output.

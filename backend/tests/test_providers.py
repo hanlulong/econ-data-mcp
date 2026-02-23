@@ -10,6 +10,7 @@ from backend.providers.worldbank import WorldBankProvider
 from backend.providers.imf import IMFProvider
 from backend.providers.bis import BISProvider
 from backend.providers.eurostat import EurostatProvider
+from backend.providers.oecd import OECDProvider
 from backend.tests.utils import MockAsyncClient, MockAsyncResponse, run
 
 
@@ -338,6 +339,17 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(series.data[0].value, 1.2)
         self.assertEqual(metadata_stub.keyword, "custom imf")
 
+    def test_imf_code_input_uses_friendly_catalog_label(self) -> None:
+        provider = IMFProvider(metadata_search_service=None)
+
+        code, label = run(provider._resolve_indicator_code("GGXWDG_NGDP"))
+
+        self.assertEqual(code, "GGXWDG_NGDP")
+        self.assertIsNotNone(label)
+        assert label is not None
+        self.assertIn("debt", label.lower())
+        self.assertIn("gdp", label.lower())
+
     def test_bis_metadata_discovery(self) -> None:
         class StubMetadata:
             async def search_bis(self, keyword: str):
@@ -450,6 +462,44 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(series.metadata.unit, "Million euro")
         self.assertEqual(series.data[0].value, 1000)
         self.assertEqual(metadata_stub.keyword, "custom eurostat")
+
+    def test_eurostat_resolve_accepts_uppercase_table_code_with_digits(self) -> None:
+        provider = EurostatProvider(metadata_search_service=None)
+
+        dataset_code, dataset_label = run(provider._resolve_dataset_code("TEC00118"))
+
+        self.assertEqual(dataset_code, "tec00118")
+        self.assertIsNone(dataset_label)
+
+    def test_oecd_resolve_indicator_expands_catalog_code_alias(self) -> None:
+        class StubMetadata:
+            def __init__(self):
+                self.search_terms = []
+
+            async def search_with_sdmx_fallback(self, provider: str, indicator: str):
+                self.search_terms.append(indicator)
+                if indicator.lower() != "long-term interest rates":
+                    return []
+                return [{"code": "DSD_IRLT@DF_IRLT", "name": "Long-term interest rates", "agency": "OECD.SDD.TPS"}]
+
+            async def discover_indicator(self, provider: str, indicator_name: str, search_results):
+                return {
+                    "code": "DSD_IRLT@DF_IRLT",
+                    "name": "Long-term interest rates",
+                    "agency": "OECD.SDD.TPS",
+                    "confidence": 0.95,
+                }
+
+        metadata_stub = StubMetadata()
+        provider = OECDProvider(metadata_search_service=metadata_stub)
+
+        agency, dataflow, version = run(provider._resolve_indicator("IRLT"))
+
+        self.assertEqual(agency, "OECD.SDD.TPS")
+        self.assertEqual(dataflow, "DSD_IRLT@DF_IRLT")
+        self.assertEqual(version, "1.0")
+        self.assertIn("IRLT", metadata_stub.search_terms)
+        self.assertTrue(any(term.lower() == "long-term interest rates" for term in metadata_stub.search_terms))
 
     def test_worldbank_does_not_expand_short_country_codes_as_groups(self) -> None:
         provider = WorldBankProvider()

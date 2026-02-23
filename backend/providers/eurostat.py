@@ -492,12 +492,20 @@ class EurostatProvider(BaseProvider):
         if mapped:
             return mapped, self._dataset_labels.get(mapped)
 
-        # Step 2: Allow users to supply raw Eurostat dataset codes directly.
-        # Accept both lowercase and uppercase inputs (e.g., "prc_hicp_aind" or "PRC_HICP_AIND").
-        if indicator and "_" in indicator:
-            normalized_indicator = indicator.strip().lower()
-            if re.fullmatch(r"[a-z0-9_]+", normalized_indicator):
-                return normalized_indicator, self._dataset_labels.get(normalized_indicator)
+        # Step 2: Allow users to supply raw Eurostat dataset/table codes directly.
+        # Accept lowercase SDMX-style IDs (e.g., "prc_hicp_aind") and uppercase
+        # table IDs with digits (e.g., "TEC00118").
+        normalized_indicator = str(indicator or "").strip()
+        if normalized_indicator and " " not in normalized_indicator:
+            candidate_code = normalized_indicator.lower()
+            if re.fullmatch(r"[a-z0-9_]{4,}", candidate_code):
+                looks_like_dataset_code = (
+                    "_" in candidate_code
+                    or any(ch.isdigit() for ch in normalized_indicator)
+                    or normalized_indicator.isupper()
+                )
+                if looks_like_dataset_code:
+                    return candidate_code, self._dataset_labels.get(candidate_code)
 
         # Step 3: Try cross-provider indicator translator (handles IMF codes like NGDP, LUR, etc.)
         translator = get_indicator_translator()

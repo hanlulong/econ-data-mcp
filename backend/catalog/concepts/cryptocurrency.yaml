@@ -12,12 +12,21 @@ synonyms:
     - crypto
     - bitcoin
     - ethereum
+    - cryptocurrency
+    - crypto market cap
+    - crypto trading volume
   secondary:
     - digital currency
     - crypto price
     - crypto market
     - btc
     - eth
+    - token price
+    - token market cap
+    - token trading volume
+    - altcoin
+    - solana
+    - xrp
 
 explicit_exclusions:
   - digital payments

@@ -10,10 +10,18 @@ synonyms:
   primary:
     - merchandise exports
     - goods exports
+    - exports as percent of gdp
+    - exports as percentage of gdp
+    - exports share of gdp
+    - export share of gdp
+    - exports to gdp ratio
+    - export to gdp ratio
   secondary:
     - export value
     - outbound trade
     - export volume
+    - exports of goods and services as percent of gdp
+    - exports of goods and services (% of gdp)
 
 explicit_exclusions:
   - imports

@@ -10,10 +10,18 @@ synonyms:
   primary:
     - merchandise imports
     - goods imports
+    - imports as percent of gdp
+    - imports as percentage of gdp
+    - imports share of gdp
+    - import share of gdp
+    - imports to gdp ratio
+    - import to gdp ratio
   secondary:
     - import value
     - inbound trade
     - import volume
+    - imports of goods and services as percent of gdp
+    - imports of goods and services (% of gdp)
 
 explicit_exclusions:
   - exports

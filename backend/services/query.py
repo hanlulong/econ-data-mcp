@@ -307,7 +307,8 @@ class QueryService:
             intent.parameters = {}
 
         extracted_countries = self._extract_countries_from_query(query)
-        if not extracted_countries:
+        expanded_region_countries = CountryResolver.expand_regions_in_query(query)
+        if not extracted_countries and not expanded_region_countries:
             return
 
         current_country = str(intent.parameters.get("country", "") or "")
@@ -327,6 +328,25 @@ class QueryService:
 
         if not defaulted_to_us_or_empty:
             return
+
+        # Region-based multi-country override for comparative/ranking queries
+        # (e.g., "ASEAN countries", "euro area members", "G7 ranking").
+        if not extracted_countries and len(expanded_region_countries) > 1:
+            query_lower = str(query or "").lower()
+            comparative_markers = [
+                "compare", "comparison", "across", "countries", "members",
+                "highest", "lowest", "top", "rank", "ranking", "versus", "vs",
+            ]
+            if any(marker in query_lower for marker in comparative_markers):
+                previous = current_country or (",".join(current_countries) if current_countries else "")
+                intent.parameters.pop("country", None)
+                intent.parameters["countries"] = expanded_region_countries
+                logger.info(
+                    "🌍 Region Override: '%s' -> %s (query specifies a country group)",
+                    previous,
+                    expanded_region_countries,
+                )
+                return
 
         # Multi-country override (preserve query order from CountryResolver)
         if len(extracted_countries) > 1:
@@ -872,6 +892,109 @@ class QueryService:
         scored_options.sort(key=lambda item: item[0], reverse=True)
         return [option for _, option, _ in scored_options[:max_options]]
 
+    def _infer_query_concept_groups(self, query: str) -> set[str]:
+        """
+        Infer high-level concept families from a query.
+
+        Used for UX safeguards: when users ask for multiple concept families
+        in one request but parser produced a single indicator, we clarify
+        instead of returning potentially misleading partial results.
+        """
+        cues = self._extract_indicator_cues(query)
+        cues = {
+            cue for cue in cues
+            if cue not in {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+        }
+
+        groups: set[str] = set()
+        if cues & {"import", "export", "trade_balance"}:
+            groups.add("trade")
+        if cues & {"unemployment", "employment_population"}:
+            groups.add("labor")
+        if cues & {"inflation", "producer_price", "house_prices"}:
+            groups.add("prices")
+        if cues & {"debt_gdp_ratio", "public_debt", "debt_service", "household_debt", "credit"}:
+            groups.add("debt_credit")
+        if cues & {"policy_rate", "bond_yield"}:
+            groups.add("rates")
+        if cues & {"exchange_rate", "reserves"}:
+            groups.add("external")
+        if cues & {"money_supply"}:
+            groups.add("money")
+        if cues & {"savings"}:
+            groups.add("savings")
+        return groups
+
+    def _build_multi_concept_query_clarification(
+        self,
+        conversation_id: str,
+        query: str,
+        intent: Optional[ParsedIntent],
+        is_multi_indicator: bool,
+        processing_steps: Optional[List[Any]] = None,
+    ) -> Optional[QueryResponse]:
+        """
+        Ask user to select focus when query spans multiple concept families but
+        current intent resolved to a single indicator.
+        """
+        if not intent:
+            return None
+        if is_multi_indicator:
+            return None
+        if intent.indicators and len(intent.indicators) > 1:
+            return None
+
+        concept_groups = self._infer_query_concept_groups(query)
+        if len(concept_groups) < 2:
+            return None
+
+        # Avoid over-triggering for canonical single-metric openness phrasing.
+        query_lower = str(query or "").lower()
+        if (
+            "trade openness" in query_lower
+            or "exports plus imports" in query_lower
+            or "export plus import" in query_lower
+        ):
+            return None
+
+        group_labels = {
+            "trade": "trade flows",
+            "labor": "labor market",
+            "prices": "prices/inflation",
+            "debt_credit": "debt/credit",
+            "rates": "interest rates/yields",
+            "external": "external sector/FX",
+            "money": "money supply",
+            "savings": "savings",
+        }
+        detected_labels = [group_labels.get(group, group) for group in sorted(concept_groups)]
+        options = self._collect_indicator_choice_options(query, intent, max_options=4)
+
+        clarification_questions = [
+            "Your query mixes multiple indicator families, which can lead to partial or incorrect results in one fetch.",
+            f"I detected: {', '.join(detected_labels)}.",
+            "Please choose the first indicator focus to fetch accurately:",
+        ]
+        if options:
+            clarification_questions.extend(
+                f"{idx}. {option}" for idx, option in enumerate(options, start=1)
+            )
+            clarification_questions.append(
+                "Reply with the option number (for example, 1) or the exact indicator you want first."
+            )
+        else:
+            clarification_questions.append(
+                "Reply with the exact indicator focus first (for example: unemployment rate, CPI inflation, or government debt-to-GDP)."
+            )
+
+        return QueryResponse(
+            conversationId=conversation_id,
+            intent=intent,
+            clarificationNeeded=True,
+            clarificationQuestions=clarification_questions,
+            processingSteps=processing_steps,
+        )
+
     def _needs_indicator_clarification(
         self,
         query: str,
@@ -916,6 +1039,38 @@ class QueryService:
             "producer_price",
             "exchange_rate",
         }
+
+        # Framework-level concept consistency check:
+        # if query concept and returned series concept disagree, ask clarification.
+        try:
+            from .catalog_service import find_concept_by_term, find_concepts_by_code
+
+            query_concept = find_concept_by_term(query)
+            if not query_concept and intent and intent.originalQuery:
+                query_concept = find_concept_by_term(str(intent.originalQuery))
+
+            if query_concept:
+                top_provider, top_code = self._extract_series_provider_and_code(top_series)
+                top_series_concepts = (
+                    find_concepts_by_code(top_provider, top_code)
+                    if top_provider and top_code
+                    else []
+                )
+                if top_series_concepts and query_concept not in top_series_concepts:
+                    return True
+
+                if not top_series_concepts and top_meta:
+                    inferred_series_concept = find_concept_by_term(
+                        str(getattr(top_meta, "indicator", "") or "")
+                    )
+                    if (
+                        inferred_series_concept
+                        and inferred_series_concept != query_concept
+                        and (bool(high_signal_query_cues) or top_score < 1.5)
+                    ):
+                        return True
+        except Exception:
+            pass
 
         # Cross-check with provider-agnostic resolver for framework-level ambiguity detection.
         # If the best canonical match disagrees with returned series/provider, ask clarification.
@@ -1255,7 +1410,7 @@ class QueryService:
 
     def _normalize_bis_metadata_labels(self, data: List[Any]) -> None:
         """
-        Replace opaque BIS indicator codes with human-readable labels when possible.
+        Replace opaque provider indicator codes with human-readable labels when possible.
 
         Applies both to fresh and cached responses so user-facing metadata stays clear.
         """
@@ -1268,25 +1423,43 @@ class QueryService:
                 continue
 
             source = normalize_provider_name(str(getattr(metadata, "source", "") or ""))
-            if source != "BIS":
-                continue
-
             indicator_value = str(getattr(metadata, "indicator", "") or "").strip()
             series_id_value = str(getattr(metadata, "seriesId", "") or "").strip().upper()
-            code_value = series_id_value
-            if not code_value:
-                indicator_upper = indicator_value.upper()
-                if indicator_upper.startswith("WS_"):
-                    code_value = indicator_upper
+            description_value = str(getattr(metadata, "description", "") or "").strip()
 
-            if not code_value:
-                continue
+            if source == "BIS":
+                code_value = series_id_value
+                if not code_value:
+                    indicator_upper = indicator_value.upper()
+                    if indicator_upper.startswith("WS_"):
+                        code_value = indicator_upper
 
-            name, description = self.bis_provider._lookup_dataflow_info(code_value)
-            if name and (not indicator_value or indicator_value.upper() == code_value):
-                metadata.indicator = name
-            if description and not getattr(metadata, "description", None):
-                metadata.description = description
+                if code_value:
+                    name, description = self.bis_provider._lookup_dataflow_info(code_value)
+                    if name and (not indicator_value or indicator_value.upper() == code_value):
+                        metadata.indicator = name
+                        indicator_value = str(name).strip()
+                    if description and not description_value:
+                        metadata.description = description
+                        description_value = str(description).strip()
+
+            # Generic fallback for all providers:
+            # if indicator is code-like and we have a human-readable description,
+            # promote description to user-facing indicator label.
+            if description_value:
+                indicator_code_like = self._looks_like_provider_indicator_code(source, indicator_value)
+                indicator_matches_series = bool(
+                    indicator_value
+                    and series_id_value
+                    and indicator_value.upper() == series_id_value.upper()
+                )
+                description_is_human = bool(re.search(r"[A-Za-z]", description_value)) and (" " in description_value)
+                if description_is_human and (
+                    not indicator_value
+                    or indicator_code_like
+                    or indicator_matches_series
+                ):
+                    metadata.indicator = description_value
 
     def _apply_concept_provider_override(
         self,
@@ -1317,24 +1490,59 @@ class QueryService:
             concept_name = find_concept_by_term(concept_query)
             if not concept_name:
                 return provider, params
-            if is_provider_available(concept_name, provider):
-                return provider, params
 
             countries_ctx = params.get("countries") if isinstance(params.get("countries"), list) else None
             if not countries_ctx:
                 country_value = params.get("country") or params.get("region")
                 countries_ctx = [country_value] if country_value else None
 
-            alt_provider, alt_code, _ = get_best_provider(concept_name, countries_ctx)
-            alt_provider_normalized = normalize_provider_name(alt_provider or "")
+            # Evaluate current provider suitability (availability + coverage + confidence)
+            preferred_provider, preferred_code, preferred_confidence = get_best_provider(
+                concept_name,
+                countries_ctx,
+                preferred_provider=provider,
+            )
+            preferred_provider_normalized = normalize_provider_name(preferred_provider or "")
+            provider_supported = (
+                bool(preferred_provider_normalized)
+                and preferred_provider_normalized == provider
+            )
+
+            best_provider, best_code, best_confidence = get_best_provider(concept_name, countries_ctx)
+            best_provider_normalized = normalize_provider_name(best_provider or "")
+
+            # Keep existing provider when:
+            # 1) it is available and suitable for requested coverage, and
+            # 2) no clearly better provider exists.
+            if provider_supported:
+                if (
+                    not best_provider_normalized
+                    or best_provider_normalized == provider
+                    or best_confidence < (preferred_confidence + 0.08)
+                ):
+                    return provider, params
+            else:
+                # If catalog still says provider is available but suitability could not be confirmed,
+                # only override when we have a concrete better provider.
+                if is_provider_available(concept_name, provider) and (
+                    not best_provider_normalized or best_provider_normalized == provider
+                ):
+                    return provider, params
+
+            alt_provider = best_provider
+            alt_code = best_code
+            alt_provider_normalized = best_provider_normalized
             if not alt_provider_normalized or alt_provider_normalized == provider:
                 return provider, params
 
             logger.info(
-                "📋 Concept override: provider %s is not available for '%s'; rerouting to %s",
-                provider,
+                "📋 Concept override: rerouting '%s' from %s to %s (best_conf=%.2f, current_conf=%.2f, coverage_ok=%s)",
                 concept_name,
+                provider,
                 alt_provider_normalized,
+                best_confidence,
+                preferred_confidence,
+                provider_supported,
             )
             provider = alt_provider_normalized
             intent.apiProvider = alt_provider or provider
@@ -1419,11 +1627,30 @@ class QueryService:
 
         original_cues = self._extract_indicator_cues(original_query)
         indicator_cues = self._extract_indicator_cues(indicator_query)
-        if original_cues and not (original_cues & indicator_cues):
+        high_signal_exclusions = {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+        high_signal_original_cues = {
+            cue for cue in original_cues if cue not in high_signal_exclusions
+        }
+        high_signal_indicator_cues = {
+            cue for cue in indicator_cues if cue not in high_signal_exclusions
+        }
+
+        if high_signal_original_cues and not (high_signal_original_cues & high_signal_indicator_cues):
             logger.info(
                 "🔎 Indicator cue mismatch (original=%s, parsed=%s). Using original query for resolution.",
-                sorted(original_cues),
-                sorted(indicator_cues),
+                sorted(high_signal_original_cues),
+                sorted(high_signal_indicator_cues),
+            )
+            return original_query
+
+        directional_cues = {"import", "export", "trade_balance"}
+        original_directional = high_signal_original_cues & directional_cues
+        indicator_directional = high_signal_indicator_cues & directional_cues
+        if original_directional and not (original_directional & indicator_directional):
+            logger.info(
+                "🔎 Directional cue mismatch (original=%s, parsed=%s). Using original query for resolution.",
+                sorted(original_directional),
+                sorted(indicator_directional),
             )
             return original_query
 
@@ -2208,8 +2435,12 @@ class QueryService:
             Original error if all fallbacks fail
         """
         primary_provider = normalize_provider_name(intent.apiProvider)
-        # Get indicator for smarter fallbacks
-        indicator = intent.indicators[0] if intent.indicators else None
+        # Use semantic indicator query (or original query) for smarter fallbacks.
+        indicator = self._select_indicator_query_for_resolution(intent)
+        if not indicator:
+            indicator = str(intent.originalQuery or "").strip() or (
+                intent.indicators[0] if intent.indicators else None
+            )
         target_countries = self._collect_target_countries(intent.parameters)
         target_country = target_countries[0] if target_countries else None
         fallback_providers = self._get_fallback_providers(
@@ -2284,7 +2515,7 @@ class QueryService:
         self,
         query: str,
         conversation_id: Optional[str] = None,
-        auto_pro_mode: bool = True,
+        auto_pro_mode: bool = False,
         use_orchestrator: bool = False,
         allow_orchestrator: bool = True,
     ) -> QueryResponse:
@@ -2436,6 +2667,16 @@ class QueryService:
             if suggestions and suggestions.get('warning'):
                 logger.info("Validation warning: %s", suggestions['warning'])
 
+            multi_concept_clarification = self._build_multi_concept_query_clarification(
+                conversation_id=conv_id,
+                query=query,
+                intent=intent,
+                is_multi_indicator=is_multi_indicator,
+                processing_steps=tracker.to_list(),
+            )
+            if multi_concept_clarification:
+                return multi_concept_clarification
+
             # Fetch data based on whether it's multi-indicator or not
             if is_multi_indicator:
                 logger.info("📊 Multi-indicator query detected: %s indicators", len(intent.indicators))
@@ -2451,6 +2692,28 @@ class QueryService:
             # Check for empty data (silent failure case) and provide meaningful error
             if not data or (isinstance(data, list) and len(data) == 0):
                 logger.warning(f"No data returned from {intent.apiProvider} for query: {query}")
+
+                # Try fallback providers before returning a hard no-data response.
+                # Empty payloads are often provider-specific coverage gaps.
+                try:
+                    logger.info("🔄 Empty result detected, attempting fallback providers...")
+                    fallback_data = await self._try_with_fallback(
+                        intent,
+                        DataNotAvailableError(
+                            f"No data returned from {intent.apiProvider} for query: {query}"
+                        ),
+                    )
+                    if fallback_data:
+                        logger.info("✅ Fallback succeeded after empty primary response")
+                        return QueryResponse(
+                            conversationId=conv_id,
+                            intent=intent,
+                            data=fallback_data,
+                            clarificationNeeded=False,
+                            processingSteps=tracker.to_list(),
+                        )
+                except Exception as fallback_exc:
+                    logger.warning("Fallback after empty response failed: %s", fallback_exc)
 
                 # Try to provide helpful context about why data might be missing
                 provider_name = intent.apiProvider
@@ -3002,6 +3265,7 @@ class QueryService:
             if provider == "IMF":
                 # Check if multiple countries are requested (batch query)
                 countries_param = params.get("countries") or params.get("country")
+                resolved_indicator = str(params.get("indicator") or "").strip()
 
                 # Resolve countries/regions to list of country codes
                 resolved_countries = []
@@ -3030,7 +3294,13 @@ class QueryService:
                     # Multiple countries - use batch method
                     logger.info("✅ Using IMF batch method for %d countries", len(resolved_countries))
                     all_data = []
-                    for indicator in intent.indicators:
+                    indicators_to_fetch = list(intent.indicators or [])
+                    if resolved_indicator:
+                        indicators_to_fetch = [resolved_indicator]
+                    if not indicators_to_fetch:
+                        indicators_to_fetch = [resolved_indicator] if resolved_indicator else []
+
+                    for indicator in indicators_to_fetch:
                         series_list = await self.imf_provider.fetch_batch_indicator(
                             indicator=indicator,
                             countries=resolved_countries,
@@ -3044,7 +3314,10 @@ class QueryService:
                     country = resolved_countries[0]
                     if len(intent.indicators) > 1:
                         all_data = []
-                        for indicator in intent.indicators:
+                        indicators_to_fetch = list(intent.indicators or [])
+                        if resolved_indicator:
+                            indicators_to_fetch = [resolved_indicator]
+                        for indicator in indicators_to_fetch:
                             series = await self.imf_provider.fetch_indicator(
                                 indicator=indicator,
                                 country=country,
@@ -3554,13 +3827,24 @@ class QueryService:
                                 break
                         # Default to bitcoin if no specific coin found
                         if not coin_ids:
-                            logger.info(f"   🪙 No specific coin found in indicators, defaulting to 'bitcoin'")
-                            coin_ids = ["bitcoin"]
+                            # Fall back to direct query text (covers cases where
+                            # indicator resolution collapses to abstract/dynamic terms).
+                            matched_from_query: list[str] = []
+                            for name, coin_id in coin_map.items():
+                                if re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", query_lower):
+                                    if coin_id not in matched_from_query:
+                                        matched_from_query.append(coin_id)
+                            if matched_from_query:
+                                coin_ids = matched_from_query
+                            else:
+                                logger.info(f"   🪙 No specific coin found in indicators/query, defaulting to 'bitcoin'")
+                                coin_ids = ["bitcoin"]
 
                 logger.info(f"   - Resolved coin_ids: {coin_ids}")
 
                 # Define indicator_lower for metric detection
                 indicator_lower = " ".join(intent.indicators).lower() if intent.indicators else ""
+                metric_text = f"{indicator_lower} {query_lower}".strip()
 
                 # Check if historical data is requested
                 if params.get("startDate") or params.get("endDate") or params.get("days"):
@@ -3568,10 +3852,10 @@ class QueryService:
 
                     # Determine the metric for historical data
                     hist_metric = "price"  # Default
-                    if any(term in indicator_lower for term in ["market cap", "market capitalization", "marketcap"]):
+                    if any(term in metric_text for term in ["market cap", "market capitalization", "marketcap"]):
                         hist_metric = "market_cap"
                         logger.info(f"   📈 Historical market cap request detected")
-                    elif any(term in indicator_lower for term in ["volume", "trading volume", "24h volume"]):
+                    elif any(term in metric_text for term in ["volume", "trading volume", "24h volume"]):
                         hist_metric = "volume"
                         logger.info(f"   📊 Historical volume request detected")
 
@@ -3617,10 +3901,10 @@ class QueryService:
 
                     # Check for ranking/top coins request
                     ranking_keywords = ["top", "top 10", "top 5", "top 20", "ranking", "rankings", "largest", "biggest"]
-                    is_ranking_request = any(term in indicator_lower for term in ranking_keywords) or \
+                    is_ranking_request = any(term in metric_text for term in ranking_keywords) or \
                                        any(term in query_lower for term in ranking_keywords)
 
-                    if is_ranking_request and ("market cap" in indicator_lower or "market cap" in query_lower):
+                    if is_ranking_request and ("market cap" in metric_text or "market cap" in query_lower):
                         # Top N cryptocurrencies by market cap
                         logger.info(f"🏆 Top cryptocurrencies by market cap request")
 
@@ -3637,13 +3921,13 @@ class QueryService:
                         logger.info(f"🎉 CoinGecko: Returning top {len(result)} cryptocurrencies")
                         return result
 
-                    if any(term in indicator_lower for term in ["volume", "trading volume", "24h volume", "24-hour volume"]):
+                    if any(term in metric_text for term in ["volume", "trading volume", "24h volume", "24-hour volume"]):
                         metric = "volume"
                         logger.info(f"📊 Volume request detected")
-                    elif any(term in indicator_lower for term in ["market cap", "market capitalization", "marketcap"]):
+                    elif any(term in metric_text for term in ["market cap", "market capitalization", "marketcap"]):
                         metric = "market_cap"
                         logger.info(f"📈 Market cap request detected")
-                    elif any(term in indicator_lower for term in ["24h change", "24 hour change", "price change", "change"]):
+                    elif any(term in metric_text for term in ["24h change", "24 hour change", "price change", "change"]):
                         metric = "24h_change"
                         logger.info(f"📉 24h change request detected")
 
@@ -3849,6 +4133,17 @@ class QueryService:
                     country = result.get("country") or ""
 
                     logger.warning(f"Orchestrator: No data returned from {provider_name}")
+                    if provider_name == "Unknown" or indicators == "requested indicator":
+                        logger.warning(
+                            "Orchestrator returned empty result without usable routing metadata. "
+                            "Retrying through standard pipeline."
+                        )
+                        return await self._standard_query_processing(
+                            query,
+                            conversation_id,
+                            tracker,
+                            record_user_message=False,
+                        )
 
                     error_details = []
                     error_details.append(f"No data found for **{indicators}**")
@@ -4145,6 +4440,7 @@ class QueryService:
 
                 # Filter any remaining None values
                 data = _filter_valid_data(data)
+                self._normalize_bis_metadata_labels(data)
                 data = self._rerank_data_by_query_relevance(query, data)
 
                 todos = result.get("todos", [])
@@ -4412,6 +4708,8 @@ class QueryService:
             # Handle standard data result
             query_result = result.get("result", {})
             data = query_result.get("data", [])
+            if isinstance(data, list):
+                self._normalize_bis_metadata_labels(data)
             if isinstance(data, list) and data:
                 data = self._rerank_data_by_query_relevance(query, data)
 
@@ -4478,6 +4776,7 @@ class QueryService:
 
                 # Source 3: Check parsed_intent
                 parsed_intent = result.get("parsed_intent")
+                coerced_intent = self._coerce_parsed_intent(parsed_intent, query)
                 if parsed_intent:
                     if isinstance(parsed_intent, dict):
                         if provider_name == "Unknown":
@@ -4500,9 +4799,9 @@ class QueryService:
                 logger.warning(f"LangGraph: No data returned from {provider_name} for query")
 
                 # Try fallback providers before giving up (same as standard path)
-                if parsed_intent and provider_name != "Unknown":
+                if coerced_intent and provider_name != "Unknown":
                     try:
-                        fallback_intent = self._coerce_parsed_intent(parsed_intent, query)
+                        fallback_intent = coerced_intent
                         if not fallback_intent:
                             raise ValueError("Could not parse LangGraph fallback intent")
 
@@ -4524,6 +4823,23 @@ class QueryService:
                     except Exception as fallback_err:
                         logger.warning(f"LangGraph: All fallbacks failed: {fallback_err}")
 
+                # If LangGraph could not produce usable routing context, retry deterministic path.
+                if (
+                    not coerced_intent
+                    or provider_name == "Unknown"
+                    or indicators == "requested indicator"
+                ):
+                    logger.warning(
+                        "LangGraph returned empty/under-specified data response. "
+                        "Retrying via standard pipeline."
+                    )
+                    return await self._standard_query_processing(
+                        query,
+                        conversation_id,
+                        tracker,
+                        record_user_message=False,
+                    )
+
                 error_details = []
                 error_details.append(f"No data found for **{indicators}**")
                 if country:
@@ -4538,7 +4854,7 @@ class QueryService:
 
                 return QueryResponse(
                     conversationId=conversation_id,
-                    intent=parsed_intent if isinstance(parsed_intent, ParsedIntent) else None,
+                    intent=coerced_intent,
                     data=None,
                     clarificationNeeded=False,
                     error="no_data_found",
@@ -4656,6 +4972,16 @@ class QueryService:
                 clarificationQuestions=intent.clarificationQuestions,
                 processingSteps=tracker.to_list() if tracker else None,
             )
+
+        multi_concept_clarification = self._build_multi_concept_query_clarification(
+            conversation_id=conversation_id,
+            query=query,
+            intent=intent,
+            is_multi_indicator=bool(intent.indicators and len(intent.indicators) > 1),
+            processing_steps=tracker.to_list() if tracker else None,
+        )
+        if multi_concept_clarification:
+            return multi_concept_clarification
 
         # Fetch data
         data = await retry_async(

@@ -81,6 +81,17 @@ class TestCountryResolver:
         assert "BRICS" in china_regions
         assert "G20" in china_regions
 
+    def test_energy_exporter_region_detection_prefers_energy_group(self):
+        """Oil-exporter phrasing should map to generalized energy exporters."""
+        regions = CountryResolver.detect_regions_in_query("compare debt across oil exporters")
+        assert "ENERGY_EXPORTERS" in regions
+        assert "OPEC" not in regions
+
+    def test_region_detection_uses_word_boundaries(self):
+        """Region keyword matching should avoid substring false positives."""
+        regions = CountryResolver.detect_regions_in_query("show specific country inflation")
+        assert "PACIFIC_ISLANDS" not in regions
+
 
 class TestKeywordMatcher:
     """Tests for KeywordMatcher."""

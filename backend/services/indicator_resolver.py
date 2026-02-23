@@ -210,12 +210,18 @@ class IndicatorResolver:
         concept_query = self._normalize_query_for_concept_lookup(query)
         query_concept = find_concept_by_term(concept_query) or find_concept_by_term(query)
         preferred_catalog_codes: Set[str] = set()
+        placeholder_catalog_code: Optional[str] = None
         if provider and query_concept:
             preferred_catalog_codes = {
                 self._normalize_code(code)
                 for code in get_indicator_codes(query_concept, provider)
                 if code
             }
+            if not preferred_catalog_codes:
+                primary_catalog_code = get_indicator_code(query_concept, provider)
+                normalized_primary_code = self._normalize_code(primary_catalog_code)
+                if normalized_primary_code in {"DYNAMIC", "NONE", "N/A"}:
+                    placeholder_catalog_code = str(primary_catalog_code)
 
         # 1. Try exact code match in database
         if provider:
@@ -283,6 +289,18 @@ class IndicatorResolver:
                 provider=provider,
                 concept_name=query_concept,
                 preferred_codes=preferred_catalog_codes,
+            )
+
+        # 3b. Some concepts intentionally use dynamic provider-side discovery
+        # (e.g., CoinGecko/Comtrade). Prefer this catalog signal over low-quality
+        # lexical matches that may map to unrelated provider-specific IDs.
+        if not result and provider and query_concept and placeholder_catalog_code:
+            result = ResolvedIndicator(
+                code=placeholder_catalog_code,
+                provider=provider,
+                name=query_concept.replace("_", " ").title(),
+                confidence=0.82,
+                source="catalog",
             )
 
         # 4. Try FTS5 search in database (fallback for terms not in translator/catalog)
