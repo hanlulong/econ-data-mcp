@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
-from ..models import CodeExecutionResult, GeneratedFile, NormalizedData, ParsedIntent, QueryResponse
+from ..models import CodeExecutionResult, DataPoint, GeneratedFile, NormalizedData, ParsedIntent, QueryResponse
 from ..config import Settings
 from ..services.cache import cache_service
 from ..services.redis_cache import get_redis_cache
@@ -176,7 +176,7 @@ def _coerce_generated_file(file_item: Any) -> Optional[GeneratedFile]:
 
 class QueryService:
     # Bump when cache semantics change so stale entries from old logic are not reused.
-    CACHE_KEY_VERSION = "2026-02-21.2"
+    CACHE_KEY_VERSION = "2026-02-23.1"
     MAX_FALLBACK_CACHE_ENTRIES = 1024
 
     def __init__(
@@ -254,7 +254,9 @@ class QueryService:
 
         # Provider keywords with their variations
         provider_patterns = {
-            "OECD": ["oecd", "from oecd", "using oecd", "via oecd", "according to oecd", "oecd data"],
+            # Bare "oecd" can denote country group context (for example "OECD economies"),
+            # not an explicit provider request. Require explicit phrasing.
+            "OECD": ["from oecd", "using oecd", "via oecd", "according to oecd", "oecd data"],
             "FRED": ["fred", "from fred", "using fred", "via fred", "federal reserve", "st. louis fed", "stlouisfed"],
             "WORLDBANK": ["world bank", "worldbank", "from world bank", "using world bank", "world bank data"],
             "Comtrade": ["comtrade", "un comtrade", "from comtrade", "using comtrade", "united nations comtrade"],
@@ -326,32 +328,58 @@ class QueryService:
             or (len(current_countries) == 1 and _is_us(current_countries[0]))
         )
 
-        if not defaulted_to_us_or_empty:
-            return
-
         # Region-based multi-country override for comparative/ranking queries
         # (e.g., "ASEAN countries", "euro area members", "G7 ranking").
-        if not extracted_countries and len(expanded_region_countries) > 1:
+        if len(expanded_region_countries) > 1:
             query_lower = str(query or "").lower()
             comparative_markers = [
                 "compare", "comparison", "across", "countries", "members",
+                "economies",
                 "highest", "lowest", "top", "rank", "ranking", "versus", "vs",
             ]
             if any(marker in query_lower for marker in comparative_markers):
-                previous = current_country or (",".join(current_countries) if current_countries else "")
-                intent.parameters.pop("country", None)
-                intent.parameters["countries"] = expanded_region_countries
-                logger.info(
-                    "🌍 Region Override: '%s' -> %s (query specifies a country group)",
-                    previous,
-                    expanded_region_countries,
-                )
-                return
+                current_geo = current_countries[:] if current_countries else ([current_country] if current_country else [])
+                normalized_current = [
+                    self._normalize_country_to_iso2(country) or str(country).upper()
+                    for country in current_geo
+                    if country
+                ]
+                normalized_target = [
+                    self._normalize_country_to_iso2(country) or str(country).upper()
+                    for country in expanded_region_countries
+                ]
+                if normalized_current != normalized_target:
+                    previous = current_country or (",".join(current_countries) if current_countries else "")
+                    intent.parameters.pop("country", None)
+                    intent.parameters["countries"] = expanded_region_countries
+                    logger.info(
+                        "🌍 Region Override: '%s' -> %s (query specifies a country group)",
+                        previous,
+                        expanded_region_countries,
+                    )
+                    return
 
-        # Multi-country override (preserve query order from CountryResolver)
+        # Multi-country override should apply whenever query explicitly names multiple
+        # countries, even if parser already selected one non-US country.
         if len(extracted_countries) > 1:
-            non_us = [c for c in extracted_countries if c.upper() != "US"]
-            if non_us:
+            normalized_current = [
+                self._normalize_country_to_iso2(country) or str(country).upper()
+                for country in current_countries
+                if country
+            ]
+            if current_country:
+                normalized_current.append(
+                    self._normalize_country_to_iso2(current_country) or str(current_country).upper()
+                )
+            normalized_current = list(dict.fromkeys(normalized_current))
+
+            normalized_extracted = [
+                self._normalize_country_to_iso2(country) or str(country).upper()
+                for country in extracted_countries
+            ]
+            normalized_extracted = list(dict.fromkeys(normalized_extracted))
+
+            if normalized_current != normalized_extracted:
                 previous = current_country or (",".join(current_countries) if current_countries else "")
                 intent.parameters.pop("country", None)
                 intent.parameters["countries"] = extracted_countries
@@ -362,7 +390,12 @@ class QueryService:
                 )
             return
 
+        if not defaulted_to_us_or_empty:
+            return
+
         # Single-country override
+        if not extracted_countries:
+            return
         extracted_country = extracted_countries[0]
         if extracted_country.upper() != "US":
             previous = current_country or (current_countries[0] if current_countries else "")
@@ -415,6 +448,15 @@ class QueryService:
             query,
             intent.indicators,
         )
+        if countries and len(countries) > 1 and not self._provider_covers_country_list(routed_provider, countries):
+            logger.info(
+                "🧭 Coverage override: %s does not cover countries=%s, using WorldBank baseline",
+                routed_provider,
+                countries,
+            )
+            routed_provider = "WORLDBANK"
+            deterministic_match_type = "coverage_override"
+            deterministic_confidence = min(deterministic_confidence or 0.0, 0.78)
 
         if self.semantic_provider_router:
             try:
@@ -432,6 +474,13 @@ class QueryService:
                     query,
                     intent.indicators,
                 )
+                if countries and len(countries) > 1 and not self._provider_covers_country_list(semantic_provider, countries):
+                    logger.info(
+                        "🧭 Semantic provider rejected by coverage: %s for countries=%s",
+                        semantic_provider,
+                        countries,
+                    )
+                    return routed_provider
                 semantic_confidence = float(getattr(decision, "confidence", 0.0) or 0.0)
                 # Framework guardrail: preserve high-confidence deterministic decisions unless
                 # semantic routing is materially stronger. This prevents low-similarity
@@ -504,11 +553,11 @@ class QueryService:
             "percent", "percentage", "ratio", "share", "rate", "index",
             "gdp", "value", "values",
         }
-        geo_terms = {
-            alias.strip().lower()
-            for alias in CountryResolver.COUNTRY_ALIASES.keys()
-            if alias and " " not in alias
-        }
+        geo_terms: set[str] = set()
+        for alias in CountryResolver.COUNTRY_ALIASES.keys():
+            for token in re.findall(r"[a-z0-9]+", str(alias or "").lower()):
+                if len(token) >= 2:
+                    geo_terms.add(token)
 
         raw_terms = set(re.findall(r"[a-z0-9]+", text.lower().replace("_", " ")))
         terms: set[str] = set()
@@ -533,7 +582,28 @@ class QueryService:
         cue_map = {
             "import": {"import", "imports"},
             "export": {"export", "exports"},
-            "trade_balance": {"trade balance", "trade surplus", "trade deficit"},
+            "trade_balance": {
+                "trade balance",
+                "trade surplus",
+                "trade deficit",
+                "net trade balance",
+                "external balance on goods and services",
+                "net exports",
+            },
+            "current_account": {
+                "current account",
+                "current account balance",
+                "balance of payments current account",
+                "bca_ngdpd",
+                "bn.cab",
+            },
+            "trade_openness": {
+                "trade openness",
+                "trade (% of gdp)",
+                "exports plus imports",
+                "imports plus exports",
+                "exports and imports as % of gdp",
+            },
             "debt": {"debt", "liability", "liabilities"},
             "debt_service": {"debt service", "debt service ratio", "dsr"},
             "debt_gdp_ratio": {
@@ -541,9 +611,15 @@ class QueryService:
                 "debt-to-gdp",
                 "debt as % of gdp",
                 "debt as percentage of gdp",
+                "debt (% of gdp)",
+                "debt, total (% of gdp)",
                 "% of gdp debt",
                 "gdp to debt ratio",
                 "gdp/debt ratio",
+            },
+            "gdp_deflator": {
+                "gdp deflator",
+                "gross domestic product deflator",
             },
             "public_debt": {
                 "government debt",
@@ -556,6 +632,7 @@ class QueryService:
             "household_debt": {"household debt"},
             "unemployment": {"unemployment", "jobless"},
             "inflation": {"inflation", "consumer price", "cpi"},
+            "hicp": {"hicp", "harmonized index", "harmonised index", "harmonized consumer price"},
             "producer_price": {"producer price", "ppi", "wholesale price"},
             "policy_rate": {"policy rate", "repo rate", "fed funds", "federal funds", "benchmark rate", "cash rate"},
             "bond_yield": {
@@ -589,7 +666,14 @@ class QueryService:
             "discontinued": {"discontinued", "deprecated", "legacy"},
             "savings": {"saving", "savings"},
             "credit": {"credit", "lending", "loan"},
-            "exchange_rate": {"exchange rate", "forex", "fx", "reer", "neer", "effective exchange rate"},
+            "exchange_rate": {"exchange rate", "forex", "fx", "currency pair", "us dollar exchange"},
+            "real_effective_exchange_rate": {
+                "reer",
+                "real effective exchange rate",
+                "real effective fx",
+                "trade weighted real exchange rate",
+                "ereer",
+            },
             "gdp": {"gdp", "gross domestic product"},
         }
 
@@ -597,7 +681,65 @@ class QueryService:
         for cue, phrases in cue_map.items():
             if any(phrase in search_text for phrase in phrases):
                 cues.add(cue)
+
+        # "Energy importers/exporters" is a country-group qualifier, not a
+        # directional trade-flow request. Keep current-account semantics primary.
+        energy_group_patterns = (
+            "energy importers",
+            "energy importing countries",
+            "net energy importers",
+            "oil importers",
+            "energy exporters",
+            "energy exporting countries",
+            "net energy exporters",
+            "oil exporters",
+        )
+        if any(pattern in search_text for pattern in energy_group_patterns):
+            cues.add("energy_group")
+            if "current_account" in cues:
+                cues.discard("import")
+                cues.discard("export")
+                cues.discard("trade_balance")
+
+        # Capture ratio phrasing variants not reliably covered by static phrase lists.
+        debt_ratio_patterns = [
+            r"\bdebt\b.{0,36}\b(?:% of gdp|percent of gdp|percentage of gdp|to gdp|gdp ratio)\b",
+            r"\bgdp\b.{0,24}\bdebt\b.{0,12}\bratio\b",
+        ]
+        if any(re.search(pattern, search_text) for pattern in debt_ratio_patterns):
+            cues.add("debt_gdp_ratio")
+
         return cues
+
+    @staticmethod
+    def _specific_cues_compatible(
+        query_cues: set[str],
+        candidate_cues: set[str],
+    ) -> bool:
+        """
+        Determine whether two cue sets are semantically compatible.
+
+        Exact cue overlap is preferred, but closely related cue families are accepted
+        to avoid discarding valid matches due wording differences.
+        """
+        if not query_cues:
+            return True
+        if query_cues & candidate_cues:
+            return True
+
+        compatible_families = [
+            {"debt_gdp_ratio", "public_debt"},
+            {"trade_openness", "import", "export", "trade_balance"},
+            {"gdp_deflator", "inflation", "producer_price"},
+            {"bond_yield", "policy_rate", "tenor_2y", "tenor_10y", "tenor_30y"},
+            {"exchange_rate", "real_effective_exchange_rate", "reserves"},
+            {"current_account", "trade_balance"},
+        ]
+        for family in compatible_families:
+            if (query_cues & family) and (candidate_cues & family):
+                return True
+
+        return False
 
     def _series_text_for_relevance(self, series: Any) -> str:
         """Build a comparable text blob from a series metadata payload."""
@@ -670,6 +812,13 @@ class QueryService:
             score -= 2.2
         if "trade_balance" in query_cues and "trade_balance" not in series_cues:
             score -= 2.2
+        if "current_account" in query_cues and "current_account" not in series_cues:
+            score -= 2.6
+        if "trade_openness" in query_cues:
+            if "trade_openness" in series_cues:
+                score += 2.5
+            else:
+                score -= 2.6
         if "debt_service" in query_cues and "debt_service" not in series_cues:
             score -= 2.2
         if "debt_gdp_ratio" in query_cues:
@@ -679,6 +828,10 @@ class QueryService:
                 score -= 2.8
             if "debt_service" in series_cues:
                 score -= 3.0
+        if "gdp_deflator" in query_cues and "gdp_deflator" not in series_cues:
+            score -= 2.8
+        if "hicp" in query_cues and "hicp" not in series_cues:
+            score -= 2.6
         if "public_debt" in query_cues and "public_debt" not in series_cues:
             if ("household_debt" in series_cues) or ("credit" in series_cues) or ("debt_service" in series_cues):
                 score -= 2.4
@@ -686,6 +839,8 @@ class QueryService:
             score -= 1.8
         if "exchange_rate" in query_cues and "exchange_rate" not in series_cues:
             score -= 1.8
+        if "real_effective_exchange_rate" in query_cues and "real_effective_exchange_rate" not in series_cues:
+            score -= 2.8
         if "money_supply" in query_cues and "money_supply" not in series_cues:
             score -= 2.2
         if "bond_yield" in query_cues and "bond_yield" not in series_cues:
@@ -716,6 +871,23 @@ class QueryService:
         # Trade flow totals are usually not ratio indicators.
         if has_ratio_query and "total trade" in series_text:
             score -= 1.5
+        if has_ratio_query and ({"import", "export"} & query_cues):
+            ratio_signals = (
+                "% of gdp",
+                "percent of gdp",
+                "percentage of gdp",
+                "share of gdp",
+                "ne.imp.gnfs.zs",
+                "ne.exp.gnfs.zs",
+                "_ngdp",
+            )
+            has_directional_ratio_signal = any(signal in series_text for signal in ratio_signals)
+            if has_directional_ratio_signal:
+                score += 1.2
+            else:
+                score -= 2.6
+                if any(token in series_text for token in ("current us$", "constant us$", "million", "billion")):
+                    score -= 1.2
 
         return score
 
@@ -744,6 +916,645 @@ class QueryService:
         filtered = [series for score, _, series in scored if score >= max(0.0, top_score - 3.0)]
         return filtered or reranked
 
+    def _extract_ranking_value(
+        self,
+        series: NormalizedData,
+        target_year: Optional[int],
+    ) -> tuple[Optional[float], Optional[DataPoint]]:
+        """Extract comparable ranking value from one series."""
+        points = list(series.data or [])
+        if not points:
+            return None, None
+
+        selected_point: Optional[DataPoint] = None
+        if target_year:
+            year_prefix = f"{target_year:04d}"
+            year_points = [
+                point for point in points
+                if str(point.date).startswith(year_prefix) and point.value is not None
+            ]
+            if year_points:
+                selected_point = sorted(year_points, key=lambda point: str(point.date))[-1]
+
+        if selected_point is None:
+            valid_points = [point for point in points if point.value is not None]
+            if valid_points:
+                selected_point = sorted(valid_points, key=lambda point: str(point.date))[-1]
+
+        if selected_point is None:
+            return None, None
+        return float(selected_point.value), selected_point
+
+    def _apply_ranking_projection(self, query: str, data: List[NormalizedData]) -> List[NormalizedData]:
+        """
+        Transform ranking queries into sorted top-N datasets by latest/target-year value.
+
+        This improves UX for prompts like:
+        - "Rank top 10 economies by GDP growth in 2023"
+        - "Which ASEAN country has the highest import share of GDP since 2015"
+        """
+        if not data or not self._is_ranking_query(query):
+            return data
+
+        target_year = self._extract_target_year_from_query(query)
+        top_n = self._extract_top_n_from_query(query, default=10)
+        query_lower = str(query or "").lower()
+        descending = not any(term in query_lower for term in ("lowest", "smallest", "worst", "bottom"))
+
+        ranking_rows: List[tuple[float, int, NormalizedData, DataPoint]] = []
+        for index, series in enumerate(data):
+            value, point = self._extract_ranking_value(series, target_year)
+            if value is None or point is None:
+                continue
+            ranking_rows.append((value, index, series, point))
+
+        if not ranking_rows:
+            return data
+
+        ranking_rows.sort(key=lambda item: (item[0], -item[1]), reverse=descending)
+        selected_rows = ranking_rows[:top_n]
+
+        projected: List[NormalizedData] = []
+        for _value, _index, series, point in selected_rows:
+            projected_series = series.model_copy(deep=True)
+            projected_series.data = [point.model_copy(deep=True)]
+            projected.append(projected_series)
+
+        return projected or data
+
+    async def _maybe_recover_from_empty_data(
+        self,
+        query: str,
+        intent: Optional[ParsedIntent],
+    ) -> Optional[List[NormalizedData]]:
+        """
+        Attempt semantic/ranking recovery when a primary fetch returns empty data.
+
+        Recovery actions:
+        - Distill noisy ranking/comparison phrasing to a stable metric phrase.
+        - Expand region/group queries to explicit country lists.
+        - Re-route provider for the recovered intent and retry once.
+        """
+        if not intent:
+            return None
+
+        params = dict(intent.parameters or {})
+        if params.get("_semantic_recovery_attempted"):
+            return None
+
+        ranking_or_comparison = self._is_ranking_query(query) or self._is_comparison_query(query)
+        distilled_indicator = self._build_distilled_indicator_query(query)
+        if not ranking_or_comparison and not distilled_indicator:
+            return None
+
+        recovered_intent = intent.model_copy(deep=True)
+        recovered_params = dict(recovered_intent.parameters or {})
+        recovered_params["_semantic_recovery_attempted"] = True
+
+        if distilled_indicator:
+            recovered_intent.indicators = [distilled_indicator]
+            recovered_params.pop("indicator", None)
+            recovered_params.pop("seriesId", None)
+            recovered_params.pop("series_id", None)
+            recovered_params.pop("code", None)
+            recovered_params["indicator"] = distilled_indicator
+
+        if ranking_or_comparison:
+            target_countries = self._collect_target_countries(recovered_params)
+            if len(target_countries) < 2:
+                expanded_regions = CountryResolver.expand_regions_in_query(query)
+                explicit_countries = self._extract_countries_from_query(query)
+                target_countries = explicit_countries or expanded_regions or target_countries
+            if len(target_countries) < 2 and re.search(r"\b(economies|countries|nations)\b", str(query or "").lower()):
+                target_countries = sorted(CountryResolver.G20_MEMBERS)
+            if target_countries:
+                recovered_params.pop("country", None)
+                recovered_params["countries"] = list(dict.fromkeys([str(country) for country in target_countries if country]))
+
+        recovered_intent.parameters = recovered_params
+
+        try:
+            rerouted_provider = await self._select_routed_provider(recovered_intent, distilled_indicator or query)
+            recovered_intent.apiProvider = rerouted_provider
+        except Exception as exc:
+            logger.warning("Semantic recovery routing failed, keeping existing provider: %s", exc)
+
+        try:
+            recovered_data = await retry_async(
+                lambda: self._fetch_data(recovered_intent),
+                max_attempts=2,
+                initial_delay=0.5,
+            )
+        except Exception as exc:
+            logger.info("Semantic recovery fetch failed: %s", exc)
+            return None
+
+        if not recovered_data:
+            return None
+
+        recovered_data = self._rerank_data_by_query_relevance(query, recovered_data)
+        if ranking_or_comparison:
+            recovered_data = self._apply_ranking_projection(query, recovered_data)
+        return recovered_data
+
+    def _score_resolved_indicator_candidate(self, query: str, resolved: Any) -> float:
+        """
+        Score one resolver candidate against query semantics.
+
+        Combines resolver confidence with query-to-indicator relevance to avoid
+        over-trusting generic translator matches.
+        """
+        if not resolved or not getattr(resolved, "code", None):
+            return -999.0
+
+        provider_name = normalize_provider_name(str(getattr(resolved, "provider", "") or ""))
+        synthetic_series = {
+            "metadata": {
+                "source": provider_name,
+                "indicator": str(getattr(resolved, "name", "") or getattr(resolved, "code", "")),
+                "seriesId": str(getattr(resolved, "code", "") or ""),
+            }
+        }
+        relevance = self._score_series_relevance(query, synthetic_series)
+        confidence = float(getattr(resolved, "confidence", 0.0) or 0.0)
+        source = str(getattr(resolved, "source", "") or "").lower()
+        source_bonus = 0.0
+        if source == "database":
+            source_bonus = 0.12
+        elif source == "catalog":
+            source_bonus = 0.06
+        return confidence + (0.12 * relevance) + source_bonus
+
+    @staticmethod
+    def _is_placeholder_indicator_code(code: Optional[str]) -> bool:
+        """Return True when indicator code is a non-actionable placeholder."""
+        normalized = str(code or "").strip().upper()
+        if not normalized:
+            return True
+        return normalized in {
+            "N/A",
+            "NA",
+            "NONE",
+            "NULL",
+            "UNKNOWN",
+            "DYNAMIC",
+            "AUTO",
+            "-",
+            "--",
+            "TBD",
+        }
+
+    def _format_indicator_option_name(
+        self,
+        provider: str,
+        code: str,
+        name: Optional[str],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Build a user-facing indicator label for clarification options.
+
+        Prefers human-readable names/descriptions over opaque provider codes.
+        """
+        provider_norm = normalize_provider_name(provider)
+        code_text = str(code or "").strip()
+        candidate_name = str(name or "").strip()
+        metadata_dict = metadata or {}
+
+        description = str(metadata_dict.get("description") or "").strip()
+        if (
+            (not candidate_name or self._looks_like_provider_indicator_code(provider_norm, candidate_name))
+            and description
+            and not self._looks_like_provider_indicator_code(provider_norm, description)
+        ):
+            candidate_name = description
+
+        if provider_norm == "BIS" and code_text:
+            # BIS series codes are often opaque (for example WS_DSR); surface dataflow label.
+            flow_name, flow_description = self.bis_provider._lookup_dataflow_info(code_text.upper())
+            if flow_name and (not candidate_name or self._looks_like_provider_indicator_code(provider_norm, candidate_name)):
+                candidate_name = str(flow_name).strip()
+            elif flow_description and not candidate_name:
+                candidate_name = str(flow_description).strip()
+
+        if not candidate_name:
+            candidate_name = code_text or "Unknown indicator"
+
+        return re.sub(r"\s+", " ", candidate_name.replace("_", " ")).strip()
+
+    def _dedupe_indicator_choice_options(self, options: List[str]) -> List[str]:
+        """
+        De-duplicate clarification options while preserving order.
+
+        Removes:
+        - options without parseable provider/code
+        - placeholder/non-actionable codes (for example N/A, DYNAMIC)
+        - near-duplicate entries from the same provider with equivalent label text
+        """
+        deduped: List[str] = []
+        seen_by_code: set[tuple[str, str]] = set()
+        seen_by_label: set[tuple[str, str]] = set()
+
+        for option in options:
+            option_text = str(option or "").strip()
+            if not option_text:
+                continue
+
+            parsed = self._parse_indicator_option(option_text)
+            if not parsed:
+                continue
+
+            provider, code = parsed
+            code_upper = str(code).strip().upper()
+            if self._is_placeholder_indicator_code(code_upper):
+                continue
+
+            code_key = (provider, code_upper)
+            if code_key in seen_by_code:
+                continue
+
+            option_body = re.sub(r"^\[[^\]]+\]\s*", "", option_text)
+            option_label = re.sub(r"\([^()]*\)\s*$", "", option_body).strip().lower()
+            option_label = re.sub(r"[^a-z0-9]+", " ", option_label).strip()
+            label_key = (provider, option_label)
+
+            if option_label and label_key in seen_by_label:
+                continue
+
+            seen_by_code.add(code_key)
+            if option_label:
+                seen_by_label.add(label_key)
+            deduped.append(option_text)
+
+        return deduped
+
+    @staticmethod
+    def _parse_indicator_option(option: str) -> Optional[tuple[str, str]]:
+        """Parse one option string like '[IMF] Indicator name (CODE)'."""
+        text = str(option or "").strip()
+        if not text:
+            return None
+        match = re.search(r"^\s*\[([^\]]+)\].*?\(([^()]+)\)\s*$", text)
+        if not match:
+            return None
+        provider = normalize_provider_name(match.group(1))
+        code = str(match.group(2) or "").strip()
+        if not provider or not code:
+            return None
+        return provider, code
+
+    def _store_pending_indicator_options(
+        self,
+        conversation_id: str,
+        query: str,
+        intent: ParsedIntent,
+        options: List[str],
+        question_lines: Optional[List[str]] = None,
+    ) -> None:
+        """Persist indicator-choice clarification options for follow-up turns."""
+        if not conversation_id or not options:
+            return
+
+        clean_options = self._dedupe_indicator_choice_options(options)
+        if not clean_options:
+            return
+
+        payload = {
+            "original_query": str(query or "").strip() or str(intent.originalQuery or "").strip(),
+            "intent": intent.model_dump() if hasattr(intent, "model_dump") else None,
+            "options": [str(option) for option in clean_options if str(option).strip()],
+            "question_lines": [str(line) for line in (question_lines or []) if str(line).strip()],
+        }
+        try:
+            conversation_manager.set_pending_indicator_options(conversation_id, payload)
+        except Exception as exc:
+            logger.debug("Failed to store pending indicator options: %s", exc)
+
+    def _match_indicator_choice_option(self, user_query: str, options: List[str]) -> Optional[str]:
+        """Match a user follow-up response against stored clarification options."""
+        text = str(user_query or "").strip()
+        if not text or not options:
+            return None
+
+        numeric_patterns = [
+            r"^\s*(\d{1,2})\s*$",
+            r"^\s*(?:option|choose|pick|select)\s*(\d{1,2})\s*$",
+            r"^\s*#\s*(\d{1,2})\s*$",
+        ]
+        numeric = None
+        for pattern in numeric_patterns:
+            numeric = re.fullmatch(pattern, text.lower())
+            if numeric:
+                break
+        if not numeric:
+            ordinal_map = {
+                "first": 1,
+                "second": 2,
+                "third": 3,
+                "fourth": 4,
+                "fifth": 5,
+            }
+            ordinal_value = ordinal_map.get(text.lower().strip())
+            if ordinal_value is not None:
+                numeric = re.match(r"(\d+)", str(ordinal_value))
+        if numeric:
+            idx = int(numeric.group(1)) - 1
+            if 0 <= idx < len(options):
+                return options[idx]
+            return None
+
+        normalized = re.sub(r"\s+", " ", text.lower()).strip()
+        for option in options:
+            option_text = str(option or "").strip()
+            if not option_text:
+                continue
+
+            option_lower = re.sub(r"\s+", " ", option_text.lower()).strip()
+            option_body = re.sub(r"^\[[^\]]+\]\s*", "", option_text).strip()
+            option_body_lower = re.sub(r"\s+", " ", option_body.lower()).strip()
+
+            if normalized in {option_lower, option_body_lower}:
+                return option_text
+
+            parsed = self._parse_indicator_option(option_text)
+            if parsed and normalized == parsed[1].lower():
+                return option_text
+
+            if len(normalized) >= 6 and normalized in option_body_lower:
+                return option_text
+
+        return None
+
+    async def _try_resolve_pending_indicator_choice(
+        self,
+        query: str,
+        conversation_id: str,
+        tracker: Optional['ProcessingTracker'] = None,
+    ) -> Optional[QueryResponse]:
+        """
+        Apply a pending indicator-choice clarification when the user replies with
+        an option number or indicator text.
+        """
+        pending = conversation_manager.get_pending_indicator_options(conversation_id)
+        if not pending:
+            return None
+
+        raw_options = [str(option) for option in (pending.get("options") or []) if str(option).strip()]
+        options = self._dedupe_indicator_choice_options(raw_options)
+        if not options:
+            conversation_manager.clear_pending_indicator_options(conversation_id)
+            return None
+
+        selected_option = self._match_indicator_choice_option(query, options)
+        if not selected_option:
+            text = str(query or "").strip()
+            if re.fullmatch(r"\d{1,2}", text):
+                return QueryResponse(
+                    conversationId=conversation_id,
+                    clarificationNeeded=True,
+                    clarificationQuestions=pending.get("question_lines") or [],
+                    message="Please choose one of the listed option numbers.",
+                    processingSteps=tracker.to_list() if tracker else None,
+                )
+
+            # User moved on to a new natural-language request; clear stale state.
+            if len(text.split()) >= 3:
+                conversation_manager.clear_pending_indicator_options(conversation_id)
+            return None
+
+        parsed = self._parse_indicator_option(selected_option)
+        if not parsed:
+            conversation_manager.clear_pending_indicator_options(conversation_id)
+            return None
+
+        selected_provider, selected_code = parsed
+        original_query = str(pending.get("original_query") or "").strip()
+        raw_intent = pending.get("intent")
+        intent = self._coerce_parsed_intent(raw_intent, original_query or query)
+        if not intent:
+            conversation_manager.clear_pending_indicator_options(conversation_id)
+            return None
+
+        conversation_id = conversation_manager.add_message_safe(conversation_id, "user", query)
+
+        intent.apiProvider = selected_provider
+        intent.indicators = [selected_code]
+        intent.clarificationNeeded = False
+        intent.clarificationQuestions = []
+        if not intent.originalQuery:
+            intent.originalQuery = original_query or query
+
+        params = dict(intent.parameters or {})
+        params.pop("seriesId", None)
+        params.pop("series_id", None)
+        params.pop("code", None)
+        params["indicator"] = selected_code
+        intent.parameters = params
+
+        try:
+            if tracker:
+                with tracker.track(
+                    "clarification_selection",
+                    "✅ Applying your indicator selection...",
+                    {"provider": selected_provider, "indicator": selected_code},
+                ):
+                    data = await retry_async(
+                        lambda: self._fetch_data(intent),
+                        max_attempts=2,
+                        initial_delay=0.3,
+                    )
+            else:
+                data = await retry_async(
+                    lambda: self._fetch_data(intent),
+                    max_attempts=2,
+                    initial_delay=0.3,
+                )
+        except Exception as exc:
+            self._store_pending_indicator_options(
+                conversation_id=conversation_id,
+                query=original_query or query,
+                intent=intent,
+                options=options,
+                question_lines=pending.get("question_lines") or [],
+            )
+            return QueryResponse(
+                conversationId=conversation_id,
+                intent=intent,
+                clarificationNeeded=True,
+                clarificationQuestions=pending.get("question_lines") or [],
+                error=str(exc),
+                message="That option did not return usable data. Please choose a different option.",
+                processingSteps=tracker.to_list() if tracker else None,
+            )
+
+        if data:
+            data = self._rerank_data_by_query_relevance(intent.originalQuery or query, data)
+            if self._is_ranking_query(intent.originalQuery or query):
+                data = self._apply_ranking_projection(intent.originalQuery or query, data)
+
+            recovered_data = await self._maybe_recover_from_uncertain_match(
+                intent.originalQuery or query,
+                intent,
+                data,
+            )
+            if recovered_data:
+                data = recovered_data
+
+            clarification_response = self._build_uncertain_result_clarification(
+                conversation_id=conversation_id,
+                query=intent.originalQuery or query,
+                intent=intent,
+                data=data,
+                processing_steps=tracker.to_list() if tracker else None,
+            )
+            if clarification_response:
+                return clarification_response
+
+        conversation_id = conversation_manager.add_message_safe(
+            conversation_id,
+            "assistant",
+            f"Retrieved data for selected indicator {selected_code}.",
+            intent=intent,
+        )
+        conversation_manager.clear_pending_indicator_options(conversation_id)
+
+        return QueryResponse(
+            conversationId=conversation_id,
+            intent=intent,
+            data=data,
+            clarificationNeeded=False,
+            processingSteps=tracker.to_list() if tracker else None,
+        )
+
+    async def _maybe_recover_from_uncertain_match(
+        self,
+        query: str,
+        intent: Optional[ParsedIntent],
+        data: List[NormalizedData],
+    ) -> Optional[List[NormalizedData]]:
+        """
+        Try one automatic refetch when current top match looks uncertain.
+
+        This is a framework-level recovery step before asking the user to pick
+        from options. It reduces clarification loops when a clearly better
+        indicator/provider exists.
+        """
+        if not intent or not data:
+            return None
+        if intent.indicators and len(intent.indicators) > 1:
+            return None
+
+        params = dict(intent.parameters or {})
+        if params.get("_uncertain_recovery_attempted"):
+            return None
+        if not self._needs_indicator_clarification(query, data, intent):
+            return None
+
+        top_series = data[0]
+        current_score = self._score_series_relevance(query, top_series)
+        top_provider, top_code = self._extract_series_provider_and_code(top_series)
+
+        target_countries = self._collect_target_countries(params)
+        target_country = target_countries[0] if target_countries else None
+        indicator_query = self._select_indicator_query_for_resolution(intent) or query
+        primary_provider = normalize_provider_name(intent.apiProvider or "")
+        explicit_provider = normalize_provider_name(self._detect_explicit_provider(intent.originalQuery or "") or "")
+
+        resolver = get_indicator_resolver()
+        candidate_keys: set[tuple[str, str]] = set()
+        candidate_ordered: List[tuple[str, str]] = []
+
+        def _add_candidate(provider_name: str, code: str) -> None:
+            provider_norm = normalize_provider_name(provider_name or "")
+            code_norm = str(code or "").strip()
+            if not provider_norm or not code_norm:
+                return
+            key = (provider_norm, code_norm.upper())
+            if key in candidate_keys:
+                return
+            candidate_keys.add(key)
+            candidate_ordered.append((provider_norm, code_norm))
+
+        try:
+            direct = resolver.resolve(
+                indicator_query,
+                provider=primary_provider or None,
+                country=target_country,
+                countries=target_countries or None,
+                use_cache=False,
+            )
+            if direct and getattr(direct, "code", None):
+                _add_candidate(getattr(direct, "provider", primary_provider), getattr(direct, "code", ""))
+        except Exception:
+            pass
+
+        try:
+            broad = resolver.resolve(
+                indicator_query,
+                country=target_country,
+                countries=target_countries or None,
+                use_cache=False,
+            )
+            if broad and getattr(broad, "code", None):
+                _add_candidate(getattr(broad, "provider", primary_provider), getattr(broad, "code", ""))
+        except Exception:
+            pass
+
+        for option in self._collect_indicator_choice_options(query, intent, max_options=4):
+            parsed = self._parse_indicator_option(option)
+            if parsed:
+                _add_candidate(parsed[0], parsed[1])
+
+        best_data: Optional[List[NormalizedData]] = None
+        best_score = current_score
+
+        for provider_name, code in candidate_ordered:
+            if top_provider and top_code and provider_name == top_provider and code.upper() == top_code.upper():
+                continue
+            if explicit_provider and provider_name != explicit_provider:
+                continue
+
+            attempt_intent = intent.model_copy(deep=True)
+            attempt_intent.apiProvider = provider_name
+            attempt_intent.indicators = [code]
+            attempt_params = dict(attempt_intent.parameters or {})
+            attempt_params["_uncertain_recovery_attempted"] = True
+            attempt_params.pop("seriesId", None)
+            attempt_params.pop("series_id", None)
+            attempt_params.pop("code", None)
+            attempt_params["indicator"] = code
+            attempt_intent.parameters = attempt_params
+
+            try:
+                candidate_data = await retry_async(
+                    lambda i=attempt_intent: self._fetch_data(i),
+                    max_attempts=2,
+                    initial_delay=0.4,
+                )
+            except Exception:
+                continue
+            if not candidate_data:
+                continue
+
+            candidate_data = self._rerank_data_by_query_relevance(query, candidate_data)
+            if self._is_ranking_query(query):
+                candidate_data = self._apply_ranking_projection(query, candidate_data)
+            if not candidate_data:
+                continue
+            if self._has_implausible_top_series(query, candidate_data):
+                continue
+
+            candidate_score = self._score_series_relevance(query, candidate_data[0])
+            candidate_uncertain = self._needs_indicator_clarification(query, candidate_data, attempt_intent)
+            if (
+                (not candidate_uncertain and candidate_score >= (best_score + 0.10))
+                or candidate_score >= (best_score + 0.35)
+            ):
+                best_data = candidate_data
+                best_score = candidate_score
+
+        return best_data
+
     def _provider_supports_country_for_options(self, provider: str, country_iso2: Optional[str]) -> bool:
         """Lightweight country-coverage filter for clarification options."""
         if not country_iso2:
@@ -760,6 +1571,31 @@ class QueryService:
             return iso2 == "US"
         if provider_upper == "BIS":
             return iso2 in BISProvider.BIS_SUPPORTED_COUNTRIES
+        return True
+
+    def _provider_covers_country_list(self, provider: str, countries: Optional[List[str]]) -> bool:
+        """Check whether a provider can plausibly cover all requested countries."""
+        if not countries:
+            return True
+
+        provider_upper = normalize_provider_name(provider)
+        normalized_iso2 = [
+            self._normalize_country_to_iso2(country) or str(country).upper()
+            for country in countries
+            if country
+        ]
+        if not normalized_iso2:
+            return True
+
+        if provider_upper in {"STATSCAN", "STATISTICS CANADA"}:
+            return all(code == "CA" for code in normalized_iso2)
+        if provider_upper == "FRED":
+            return all(code == "US" for code in normalized_iso2)
+        if provider_upper == "EUROSTAT":
+            return all(
+                code in {"EU", "EA", "EA19", "EA20", "EU27_2020"} or CountryResolver.is_eu_member(code)
+                for code in normalized_iso2
+            )
         return True
 
     def _collect_indicator_choice_options(
@@ -842,7 +1678,9 @@ class QueryService:
 
         for provider_name in provider_candidates:
             # Skip providers that clearly don't cover the requested country context.
-            if target_iso2 and not any(
+            if target_iso2 and not self._provider_covers_country_list(provider_name, target_iso2):
+                continue
+            if target_iso2 and not all(
                 self._provider_supports_country_for_options(provider_name, iso2)
                 for iso2 in target_iso2
             ):
@@ -854,11 +1692,14 @@ class QueryService:
                     provider=provider_name,
                     country=target_country,
                     countries=target_countries or None,
+                    use_cache=False,
                 )
             except Exception:
                 resolved = None
 
             if not resolved or not resolved.code or resolved.confidence < 0.55:
+                continue
+            if self._is_placeholder_indicator_code(str(resolved.code)):
                 continue
 
             code_key = (provider_name, str(resolved.code).upper())
@@ -880,17 +1721,54 @@ class QueryService:
             option_cues = self._extract_indicator_cues(
                 f"{resolved.name or ''} {resolved.code or ''}"
             )
-            if high_signal_query_cues and not (high_signal_query_cues & option_cues):
+            if high_signal_query_cues and not self._specific_cues_compatible(
+                high_signal_query_cues,
+                option_cues,
+            ):
+                continue
+            specific_query_cues = high_signal_query_cues & {
+                "trade_openness",
+                "gdp_deflator",
+                "hicp",
+                "debt_gdp_ratio",
+                "public_debt",
+                "trade_balance",
+                "import",
+                "export",
+                "house_prices",
+                "bond_yield",
+            }
+            if specific_query_cues and not self._specific_cues_compatible(
+                specific_query_cues,
+                option_cues,
+            ):
+                continue
+            if "trade_openness" in specific_query_cues and "trade_openness" not in option_cues:
+                continue
+            if "gdp_deflator" in specific_query_cues and "gdp_deflator" not in option_cues:
+                continue
+            if "hicp" in specific_query_cues and "hicp" not in option_cues:
+                continue
+            if "debt_gdp_ratio" in specific_query_cues and not (
+                {"debt_gdp_ratio", "public_debt"} & option_cues
+            ):
                 continue
 
             combined_score = float(resolved.confidence) + (0.12 * relevance_score)
             provider_label = provider_labels.get(provider_name, provider_name)
-            option_name = str(resolved.name or resolved.code or "").replace("_", " ").strip()
+            option_name = self._format_indicator_option_name(
+                provider=provider_name,
+                code=str(resolved.code),
+                name=getattr(resolved, "name", None),
+                metadata=getattr(resolved, "metadata", None),
+            )
             option_text = f"[{provider_label}] {option_name} ({resolved.code})"
             scored_options.append((combined_score, option_text, provider_name))
 
         scored_options.sort(key=lambda item: item[0], reverse=True)
-        return [option for _, option, _ in scored_options[:max_options]]
+        raw_options = [option for _, option, _ in scored_options]
+        deduped_options = self._dedupe_indicator_choice_options(raw_options)
+        return deduped_options[:max_options]
 
     def _infer_query_concept_groups(self, query: str) -> set[str]:
         """
@@ -907,17 +1785,17 @@ class QueryService:
         }
 
         groups: set[str] = set()
-        if cues & {"import", "export", "trade_balance"}:
+        if cues & {"import", "export", "trade_balance", "trade_openness"}:
             groups.add("trade")
         if cues & {"unemployment", "employment_population"}:
             groups.add("labor")
-        if cues & {"inflation", "producer_price", "house_prices"}:
+        if cues & {"inflation", "hicp", "gdp_deflator", "producer_price", "house_prices"}:
             groups.add("prices")
         if cues & {"debt_gdp_ratio", "public_debt", "debt_service", "household_debt", "credit"}:
             groups.add("debt_credit")
         if cues & {"policy_rate", "bond_yield"}:
             groups.add("rates")
-        if cues & {"exchange_rate", "reserves"}:
+        if cues & {"exchange_rate", "real_effective_exchange_rate", "reserves", "current_account"}:
             groups.add("external")
         if cues & {"money_supply"}:
             groups.add("money")
@@ -982,6 +1860,13 @@ class QueryService:
             clarification_questions.append(
                 "Reply with the option number (for example, 1) or the exact indicator you want first."
             )
+            self._store_pending_indicator_options(
+                conversation_id=conversation_id,
+                query=query,
+                intent=intent,
+                options=options,
+                question_lines=clarification_questions,
+            )
         else:
             clarification_questions.append(
                 "Reply with the exact indicator focus first (for example: unemployment rate, CPI inflation, or government debt-to-GDP)."
@@ -1006,6 +1891,10 @@ class QueryService:
         """
         if not data:
             return False
+        if intent and intent.indicators and len(intent.indicators) > 1:
+            # Multi-indicator comparisons intentionally mix concept families;
+            # avoid forcing indicator-choice clarification loops.
+            return False
 
         scored: List[tuple[float, Any]] = [
             (self._score_series_relevance(query, series), series)
@@ -1014,6 +1903,8 @@ class QueryService:
         scored.sort(key=lambda item: item[0], reverse=True)
 
         top_score, top_series = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else -999.0
+        score_gap = top_score - second_score if len(scored) > 1 else 99.0
         top_meta = getattr(top_series, "metadata", None)
         query_cues = self._extract_indicator_cues(query)
         top_series_cues = self._extract_indicator_cues(self._series_text_for_relevance(top_series))
@@ -1025,7 +1916,9 @@ class QueryService:
             "import",
             "export",
             "trade_balance",
+            "trade_openness",
             "debt_gdp_ratio",
+            "gdp_deflator",
             "public_debt",
             "money_supply",
             "bond_yield",
@@ -1034,11 +1927,53 @@ class QueryService:
             "tenor_30y",
             "policy_rate",
             "house_prices",
+            "hicp",
             "reserves",
             "employment_population",
             "producer_price",
             "exchange_rate",
         }
+
+        # Strong-consensus guardrail: if all returned series are the same provider/code
+        # and relevance is clearly above uncertainty range, skip clarification.
+        normalized_keys: set[tuple[str, str]] = set()
+        for _, series in scored:
+            provider_name, provider_code = self._extract_series_provider_and_code(series)
+            if provider_name and provider_code:
+                normalized_keys.add((provider_name, provider_code.upper()))
+        has_consensus_code = len(normalized_keys) == 1 and len(scored) >= 2
+
+        normalized_indicator_keys: set[tuple[str, str]] = set()
+        for _, series in scored:
+            meta = getattr(series, "metadata", None) if series is not None else None
+            provider_name = normalize_provider_name(str(getattr(meta, "source", "") or "")) if meta else ""
+            indicator_text = str(getattr(meta, "indicator", "") or getattr(meta, "seriesId", "") or "").strip().lower() if meta else ""
+            indicator_text = re.sub(r"\s+", " ", indicator_text)
+            if provider_name and indicator_text:
+                normalized_indicator_keys.add((provider_name, indicator_text))
+        has_consensus_indicator = len(normalized_indicator_keys) == 1 and len(scored) >= 2
+
+        aligned_high_signal = (not high_signal_query_cues) or bool(high_signal_query_cues & top_series_cues)
+        if top_score >= 1.0 and aligned_high_signal and (
+            has_consensus_code
+            or has_consensus_indicator
+            or score_gap >= 0.45
+            or second_score < 0.8
+        ):
+            return False
+
+        top_provider = normalize_provider_name(str(getattr(top_meta, "source", "") or "")) if top_meta else ""
+        explicit_provider = normalize_provider_name(self._detect_explicit_provider(query) or "")
+        if explicit_provider and top_provider == explicit_provider and top_score >= 0.8 and aligned_high_signal:
+            return False
+
+        # High-specificity terms should not trigger clarification when already aligned.
+        if "hicp" in query_cues and "hicp" in top_series_cues and top_score >= 0.8:
+            return False
+        if "gdp_deflator" in query_cues and "gdp_deflator" in top_series_cues and top_score >= 0.8:
+            return False
+        if "trade_openness" in query_cues and "trade_openness" in top_series_cues and top_score >= 0.8:
+            return False
 
         # Framework-level concept consistency check:
         # if query concept and returned series concept disagree, ask clarification.
@@ -1122,14 +2057,14 @@ class QueryService:
                         top_provider != canonical_provider
                         and cue_conflict
                         and canonical_supports_query
-                        and top_score < 1.1
+                        and top_score < 0.85
                     ):
                         return True
                     if (
                         not _codes_match(top_code, canonical_code)
                         and cue_conflict
                         and canonical_supports_query
-                        and top_score < 0.8
+                        and top_score < 0.6
                     ):
                         return True
                     # Canonical match aligns with returned series/provider.
@@ -1137,6 +2072,13 @@ class QueryService:
                         return False
         except Exception:
             pass
+
+        if (
+            self._is_temporal_split_query(query)
+            and (high_signal_query_cues & top_series_cues)
+            and top_score >= 0.55
+        ):
+            return False
 
         if "debt_gdp_ratio" in query_cues and "debt_gdp_ratio" not in top_series_cues:
             return True
@@ -1152,8 +2094,7 @@ class QueryService:
             return True
 
         if len(scored) > 1:
-            score_gap = scored[0][0] - scored[1][0]
-            if score_gap < 0.2 and top_score < 1.0:
+            if score_gap < 0.2 and top_score < 0.7:
                 second_series_cues = self._extract_indicator_cues(
                     self._series_text_for_relevance(scored[1][1])
                 )
@@ -1173,28 +2114,73 @@ class QueryService:
         """
         Return a clarification response with options when series selection is uncertain.
         """
+        if intent and intent.indicators and len(intent.indicators) > 1:
+            return None
         if not intent or not self._needs_indicator_clarification(query, data, intent):
             return None
 
-        options = self._collect_indicator_choice_options(query, intent)
-
-        top_series = data[0] if data else None
-        top_meta = getattr(top_series, "metadata", None) if top_series else None
-        current_label = (
-            f"{getattr(top_meta, 'indicator', 'Unknown indicator')} "
-            f"from {getattr(top_meta, 'source', 'unknown source')}"
-            if top_meta else "Unknown indicator"
+        scored = sorted(
+            (
+                (self._score_series_relevance(query, series), series)
+                for series in (data or [])
+            ),
+            key=lambda item: item[0],
+            reverse=True,
         )
+        top_score, top_series = scored[0] if scored else (-1.0, None)
+        top_meta = getattr(top_series, "metadata", None) if top_series else None
+        top_provider = normalize_provider_name(getattr(top_meta, "source", "") or "") if top_meta else ""
+        top_code = str(getattr(top_meta, "seriesId", "") or "").strip().upper() if top_meta else ""
+        query_cues = self._extract_indicator_cues(query)
+        top_series_cues = self._extract_indicator_cues(self._series_text_for_relevance(top_series))
+        high_signal_query_cues = {
+            cue for cue in query_cues
+            if cue not in {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+        }
+        if top_meta and top_score >= 0.95 and (
+            not high_signal_query_cues
+            or bool(high_signal_query_cues & top_series_cues)
+        ):
+            return None
+
+        options = self._dedupe_indicator_choice_options(
+            self._collect_indicator_choice_options(query, intent)
+        )
+
+        if top_meta:
+            current_provider = normalize_provider_name(getattr(top_meta, "source", "") or "")
+            current_code = str(getattr(top_meta, "seriesId", "") or "").strip()
+            current_name = self._format_indicator_option_name(
+                provider=current_provider,
+                code=current_code,
+                name=getattr(top_meta, "indicator", "") or "",
+                metadata={"description": str(getattr(top_meta, "description", "") or "")},
+            )
+            current_label = f"{current_name} from {getattr(top_meta, 'source', 'unknown source')}"
+        else:
+            current_label = "Unknown indicator"
+
+        if options and top_meta and top_score >= 0.75:
+            leading_option = options[0].upper()
+            provider_token = f"[{top_provider}]"
+            code_token = f"({top_code})" if top_code else ""
+            if provider_token in leading_option and (not code_token or code_token in leading_option):
+                # Best ranked option already matches current top series with strong relevance.
+                # Avoid unnecessary clarification loops.
+                return None
 
         # Ensure at least two options are available for genuinely uncertain matches.
         if len(options) < 2 and top_meta:
             current_code = str(getattr(top_meta, "seriesId", "") or "").strip()
             current_provider = normalize_provider_name(getattr(top_meta, "source", "") or "")
-            current_option = (
-                f"[{current_provider}] "
-                f"{getattr(top_meta, 'indicator', 'Current match')} ({current_code or 'N/A'})"
-            )
-            if current_option not in options:
+            if not self._is_placeholder_indicator_code(current_code):
+                current_name = self._format_indicator_option_name(
+                    provider=current_provider,
+                    code=current_code,
+                    name=getattr(top_meta, "indicator", "") or "",
+                    metadata={"description": str(getattr(top_meta, "description", "") or "")},
+                )
+                current_option = f"[{current_provider}] {current_name} ({current_code})"
                 options.insert(0, current_option)
 
         if len(options) < 2:
@@ -1209,18 +2195,54 @@ class QueryService:
                     query,
                     country=target_country,
                     countries=target_countries or None,
+                    use_cache=False,
                 )
                 if canonical and canonical.code:
+                    if self._is_placeholder_indicator_code(canonical.code):
+                        canonical = None
+                if canonical and canonical.code:
                     provider_label = normalize_provider_name(canonical.provider or "")
-                    canonical_option = (
-                        f"[{provider_label}] "
-                        f"{str(canonical.name or canonical.code).replace('_', ' ').strip()} "
-                        f"({canonical.code})"
+                    canonical_cues = self._extract_indicator_cues(
+                        f"{canonical.name or ''} {canonical.code or ''}"
                     )
-                    if canonical_option not in options:
+                    cue_compatible = self._specific_cues_compatible(high_signal_query_cues, canonical_cues)
+                    provider_compatible = self._provider_covers_country_list(
+                        provider_label,
+                        target_countries or None,
+                    )
+                    if cue_compatible and provider_compatible:
+                        canonical_name = self._format_indicator_option_name(
+                            provider=provider_label,
+                            code=str(canonical.code),
+                            name=str(canonical.name or canonical.code),
+                            metadata=getattr(canonical, "metadata", None),
+                        )
+                        canonical_option = (
+                            f"[{provider_label}] "
+                            f"{canonical_name} "
+                            f"({canonical.code})"
+                        )
                         options.append(canonical_option)
             except Exception:
                 pass
+
+        options = self._dedupe_indicator_choice_options(options)
+        distinct_options: set[tuple[str, str]] = set()
+        for option in options:
+            parsed = self._parse_indicator_option(option)
+            if not parsed:
+                continue
+            provider_name, indicator_code = parsed
+            code_upper = str(indicator_code).strip().upper()
+            if self._is_placeholder_indicator_code(code_upper):
+                continue
+            distinct_options.add((provider_name, code_upper))
+
+        if top_provider and top_code and not self._is_placeholder_indicator_code(top_code):
+            distinct_options.add((top_provider, top_code))
+
+        if len(distinct_options) < 2:
+            return None
 
         if len(options) < 2:
             return None
@@ -1235,6 +2257,65 @@ class QueryService:
         )
         clarification_questions.append(
             "Reply with the option number (for example, 1) or the exact indicator text you want."
+        )
+
+        self._store_pending_indicator_options(
+            conversation_id=conversation_id,
+            query=query,
+            intent=intent,
+            options=options,
+            question_lines=clarification_questions,
+        )
+
+        return QueryResponse(
+            conversationId=conversation_id,
+            intent=intent,
+            clarificationNeeded=True,
+            clarificationQuestions=clarification_questions,
+            processingSteps=processing_steps,
+        )
+
+    def _build_no_data_indicator_clarification(
+        self,
+        conversation_id: str,
+        query: str,
+        intent: Optional[ParsedIntent],
+        processing_steps: Optional[List[Any]] = None,
+    ) -> Optional[QueryResponse]:
+        """
+        Offer indicator choices when no data is returned and intent may be ambiguous.
+
+        This improves UX for wrong/ambiguous series matches by letting users pick
+        from ranked alternatives instead of receiving a hard no-data error.
+        """
+        if not intent:
+            return None
+        if intent.indicators and len(intent.indicators) > 1:
+            return None
+
+        options = self._dedupe_indicator_choice_options(
+            self._collect_indicator_choice_options(query=query, intent=intent, max_options=4)
+        )
+        if len(options) < 2:
+            return None
+
+        clarification_questions = [
+            "I couldn't find data with the current indicator selection.",
+            "Please choose the indicator you intended:",
+        ]
+        clarification_questions.extend(
+            f"{idx}. {option}" for idx, option in enumerate(options, start=1)
+        )
+        clarification_questions.append(
+            "Reply with the option number (for example, 1) or the exact indicator text you want."
+        )
+
+        self._store_pending_indicator_options(
+            conversation_id=conversation_id,
+            query=query,
+            intent=intent,
+            options=options,
+            question_lines=clarification_questions,
         )
 
         return QueryResponse(
@@ -1280,8 +2361,8 @@ class QueryService:
             return bool(re.fullmatch(r"[A-Z0-9_@\.]{4,}", code_upper))
 
         if provider_upper == "OECD":
-            # Examples: DSD_...@DF_..., CPI, IRLT
-            return bool(re.fullmatch(r"[A-Z0-9_@\.]{5,}", code_upper))
+            # Examples: DSD_...@DF_..., CPI, PPI, IRLT
+            return bool(re.fullmatch(r"[A-Z0-9_@\.]{3,}", code_upper))
 
         if provider_upper in {"STATSCAN", "STATISTICS CANADA"}:
             return bool(re.fullmatch(r"[A-Z0-9_]{3,}", code_upper))
@@ -1303,16 +2384,93 @@ class QueryService:
         provider_upper = normalize_provider_name(provider)
         query_cues = self._extract_indicator_cues(indicator_query or "")
         code_upper = str(resolved_code or "").upper()
+        query_lower = str(indicator_query or "").lower()
 
         if not query_cues:
             return True
+
+        if "gdp_deflator" in query_cues and not any(
+            token in code_upper for token in ("DEFL", "DEFLATOR", "GDPDEFL")
+        ):
+            return False
+
+        if "hicp" in query_cues and provider_upper in {"WORLDBANK", "IMF", "FRED", "STATSCAN", "STATISTICS CANADA"}:
+            return False
+
+        ratio_patterns = [
+            "% of gdp",
+            "as % of gdp",
+            "as percent of gdp",
+            "as percentage of gdp",
+            "share of gdp",
+            "to gdp ratio",
+            "ratio to gdp",
+            "as share of gdp",
+        ]
+        has_ratio_query = any(pattern in query_lower for pattern in ratio_patterns)
+
+        if "current_account" in query_cues and not any(
+            token in code_upper for token in ("BCA", "CAB", "CURRENT", "CURR")
+        ):
+            return False
+
+        if "real_effective_exchange_rate" in query_cues and not any(
+            token in code_upper for token in ("EREER", "REER")
+        ):
+            return False
+        if (
+            "real_effective_exchange_rate" in query_cues
+            and provider_upper in {"WORLDBANK", "WORLD BANK"}
+            and code_upper == "REER"
+        ):
+            # World Bank has explicit REER series IDs; bare REER is typically too
+            # ambiguous and often coverage-poor in practice.
+            return False
+
+        if "trade_openness" in query_cues:
+            if provider_upper in {"WORLDBANK", "WORLD BANK"}:
+                # Trade openness should map to Trade (% of GDP), not net trade balance.
+                if code_upper in {"NE.RSB.GNFS.ZS", "BN.GSR.GNFS.CD"}:
+                    return False
+                if "TRD.GNFS" not in code_upper:
+                    return False
+            if provider_upper == "IMF" and "XS_GDP" not in code_upper:
+                return False
+
+        if "producer_price" in query_cues:
+            if provider_upper in {"WORLDBANK", "WORLD BANK"} and not any(
+                token in code_upper for token in ("WPI", "PPI", "FP.WPI")
+            ):
+                return False
+            if provider_upper == "IMF" and not any(
+                token in code_upper for token in ("PPI", "PPPI", "PWPI")
+            ):
+                return False
+            if provider_upper == "FRED" and "PPI" not in code_upper:
+                return False
+            if provider_upper == "OECD" and "PPI" not in code_upper:
+                return False
+
+        if "house_prices" in query_cues:
+            if provider_upper in {"WORLDBANK", "WORLD BANK", "IMF"}:
+                return False
+            if provider_upper == "BIS" and code_upper != "WS_SPP":
+                return False
+            if provider_upper == "FRED" and not any(
+                token in code_upper for token in ("HPI", "CSUSHPI", "USSTHPI")
+            ):
+                return False
+            if provider_upper == "EUROSTAT" and "HPI" not in code_upper:
+                return False
 
         if provider_upper == "FRED":
             domain_tokens = {
                 "credit": ("CREDIT", "LOAN", "LEND", "TOTBKCR", "BUSLOANS", "REVOL", "NONREV", "TOTALSL"),
                 "inflation": ("CPI", "PPI", "PCE", "DEFL", "INFL"),
                 "exchange_rate": ("DEX", "EXCH", "XRU", "REER"),
+                "real_effective_exchange_rate": ("REER",),
                 "trade_balance": ("BOP", "TRADE", "NETEXP"),
+                "current_account": ("BCA", "CURR", "CAB"),
                 "import": ("IMP", "IMPORT"),
                 "export": ("EXP", "EXPORT"),
                 "money_supply": ("M1", "M2", "M3", "MZM", "MONEY", "MONETARY"),
@@ -1326,7 +2484,6 @@ class QueryService:
                 if cue in query_cues and not any(token in code_upper for token in tokens):
                     return False
 
-            query_lower = str(indicator_query or "").lower()
             if "m1" in query_lower and "M1" not in code_upper:
                 return False
             if "m2" in query_lower and "M2" not in code_upper:
@@ -1350,6 +2507,22 @@ class QueryService:
             ):
                 return False
 
+        if provider_upper == "OECD":
+            if "bond_yield" in query_cues and not any(
+                token in code_upper for token in ("IRLT", "YIELD", "BOND")
+            ):
+                return False
+            if "gdp_deflator" in query_cues and "DEFL" not in code_upper:
+                return False
+            if "hicp" in query_cues and "HICP" not in code_upper:
+                return False
+            if "trade_openness" in query_cues and not any(
+                token in code_upper for token in ("TRADE", "XS_GDP", "BOP")
+            ):
+                return False
+            if "producer_price" in query_cues and "PPI" not in code_upper:
+                return False
+
         if provider_upper == "BIS":
             # Guardrail: generic debt-to-GDP queries should not resolve to BIS debt-service series.
             if "debt_gdp_ratio" in query_cues:
@@ -1370,6 +2543,12 @@ class QueryService:
                 and code_upper.startswith("WS_")
                 and not (query_cues & {"credit", "debt_service", "household_debt"})
             ):
+                return False
+            if "real_effective_exchange_rate" in query_cues and code_upper == "WS_XRU":
+                return False
+
+        if has_ratio_query and "trade_balance" in query_cues:
+            if provider_upper in {"WORLDBANK", "WORLD BANK"} and code_upper in {"BN.GSR.GNFS.CD"}:
                 return False
 
         return True
@@ -1480,14 +2659,38 @@ class QueryService:
         if explicit_provider_requested and explicit_provider_requested == provider:
             return provider, params
 
-        concept_query = original_query or self._select_indicator_query_for_resolution(intent)
-        if not concept_query:
+        blocked_override_providers = {
+            normalize_provider_name(str(candidate))
+            for candidate in (params.get("__fallback_excluded_providers") or [])
+            if candidate
+        }
+        blocked_override_providers.discard("")
+        in_fallback_context = bool(blocked_override_providers)
+
+        distilled_query = self._build_distilled_indicator_query(original_query) if original_query else ""
+        concept_candidates: List[str] = []
+        if original_query:
+            concept_candidates.append(original_query)
+        if distilled_query and distilled_query not in concept_candidates:
+            concept_candidates.append(distilled_query)
+
+        fallback_query = self._select_indicator_query_for_resolution(intent)
+        if fallback_query and fallback_query not in concept_candidates:
+            concept_candidates.append(fallback_query)
+
+        if not concept_candidates:
             return provider, params
 
         try:
             from .catalog_service import find_concept_by_term, get_best_provider, is_provider_available
 
-            concept_name = find_concept_by_term(concept_query)
+            concept_name = None
+            matched_query = ""
+            for candidate in concept_candidates:
+                concept_name = find_concept_by_term(candidate)
+                if concept_name:
+                    matched_query = candidate
+                    break
             if not concept_name:
                 return provider, params
 
@@ -1495,6 +2698,7 @@ class QueryService:
             if not countries_ctx:
                 country_value = params.get("country") or params.get("region")
                 countries_ctx = [country_value] if country_value else None
+            coverage_ok = self._provider_covers_country_list(provider, countries_ctx or [])
 
             # Evaluate current provider suitability (availability + coverage + confidence)
             preferred_provider, preferred_code, preferred_confidence = get_best_provider(
@@ -1507,14 +2711,33 @@ class QueryService:
                 bool(preferred_provider_normalized)
                 and preferred_provider_normalized == provider
             )
+            if not coverage_ok:
+                provider_supported = False
+                preferred_confidence = max(0.0, float(preferred_confidence or 0.0) - 0.25)
 
             best_provider, best_code, best_confidence = get_best_provider(concept_name, countries_ctx)
             best_provider_normalized = normalize_provider_name(best_provider or "")
+            requested_country_count = len(countries_ctx or [])
+            broad_global_providers = {"WORLDBANK", "IMF"}
+            niche_coverage_providers = {"OECD", "EUROSTAT", "FRED", "STATSCAN"}
 
             # Keep existing provider when:
             # 1) it is available and suitable for requested coverage, and
             # 2) no clearly better provider exists.
             if provider_supported:
+                # Guardrail for multi-country comparisons: avoid moving from broad
+                # global providers to narrower providers unless the confidence gain
+                # is material. This preserves country coverage and avoids spurious
+                # reroutes (for example, WB -> OECD on mixed-country queries).
+                confidence_gain = float(best_confidence or 0.0) - float(preferred_confidence or 0.0)
+                low_confidence_current = float(preferred_confidence or 0.0) < 0.80
+                if (
+                    requested_country_count >= 2
+                    and provider in broad_global_providers
+                    and best_provider_normalized in niche_coverage_providers
+                    and confidence_gain < (0.18 if low_confidence_current else 0.28)
+                ):
+                    return provider, params
                 if (
                     not best_provider_normalized
                     or best_provider_normalized == provider
@@ -1524,15 +2747,33 @@ class QueryService:
             else:
                 # If catalog still says provider is available but suitability could not be confirmed,
                 # only override when we have a concrete better provider.
-                if is_provider_available(concept_name, provider) and (
+                if coverage_ok and is_provider_available(concept_name, provider) and (
                     not best_provider_normalized or best_provider_normalized == provider
                 ):
                     return provider, params
+
+            if (
+                in_fallback_context
+                and best_provider_normalized
+                and best_provider_normalized != provider
+            ):
+                logger.info(
+                    "📋 Concept override skipped in fallback context: keeping %s instead of rerouting to %s",
+                    provider,
+                    best_provider_normalized,
+                )
+                return provider, params
 
             alt_provider = best_provider
             alt_code = best_code
             alt_provider_normalized = best_provider_normalized
             if not alt_provider_normalized or alt_provider_normalized == provider:
+                return provider, params
+            if alt_provider_normalized in blocked_override_providers:
+                logger.info(
+                    "📋 Concept override skipped: candidate provider %s is blocked in this fallback context",
+                    alt_provider_normalized,
+                )
                 return provider, params
 
             logger.info(
@@ -1554,7 +2795,7 @@ class QueryService:
                     intent.indicators = [alt_code]
                 logger.info(
                     "📋 Concept override indicator: %s -> %s",
-                    concept_query,
+                    matched_query,
                     alt_code,
                 )
         except Exception as exc:
@@ -1601,10 +2842,15 @@ class QueryService:
         if not original_query:
             return indicator_query
 
+        distilled_original = self._build_distilled_indicator_query(original_query)
+
+        def _fallback_to_original_or_distilled() -> str:
+            return distilled_original or original_query
+
         indicator_lower = indicator_query.lower()
         if any(term in indicator_lower for term in ("discontinued", "deprecated", "legacy")):
             logger.info("🔎 Parsed indicator appears deprecated/discontinued. Using original query.")
-            return original_query
+            return _fallback_to_original_or_distilled()
 
         ratio_patterns = [
             "% of gdp",
@@ -1623,7 +2869,7 @@ class QueryService:
             logger.info(
                 "🔎 Indicator dropped GDP-ratio context. Using original query for resolution."
             )
-            return original_query
+            return _fallback_to_original_or_distilled()
 
         original_cues = self._extract_indicator_cues(original_query)
         indicator_cues = self._extract_indicator_cues(indicator_query)
@@ -1641,7 +2887,7 @@ class QueryService:
                 sorted(high_signal_original_cues),
                 sorted(high_signal_indicator_cues),
             )
-            return original_query
+            return _fallback_to_original_or_distilled()
 
         directional_cues = {"import", "export", "trade_balance"}
         original_directional = high_signal_original_cues & directional_cues
@@ -1652,7 +2898,7 @@ class QueryService:
                 sorted(original_directional),
                 sorted(indicator_directional),
             )
-            return original_query
+            return _fallback_to_original_or_distilled()
 
         original_terms = self._tokenize_indicator_terms(original_query)
         indicator_terms = self._tokenize_indicator_terms(indicator_query)
@@ -1663,9 +2909,428 @@ class QueryService:
                     "🔎 Low indicator-term overlap (%.2f). Using original query for resolution.",
                     overlap,
                 )
-                return original_query
+                return _fallback_to_original_or_distilled()
+
+        # Ranking/comparison phrasing can contain execution words ("top", "rank",
+        # "highest") that are poor resolver inputs. Prefer a distilled metric phrase.
+        if (self._is_ranking_query(original_query) or self._is_comparison_query(original_query)) and distilled_original:
+            return distilled_original
+
+        # If parser returned a long natural-language sentence as the indicator,
+        # prefer a distilled metric phrase for stable cross-provider resolution.
+        if len(indicator_query.split()) >= 8 and distilled_original:
+            return distilled_original
 
         return indicator_query
+
+    def _is_ranking_query(self, query: str) -> bool:
+        """Detect ranking/sorting intent from query phrasing."""
+        query_lower = str(query or "").lower()
+        return re.search(
+            r"\b(rank|ranking|ranked|top(?:\s+\d+)?|highest|lowest|largest|smallest|best|worst)\b",
+            query_lower,
+        ) is not None
+
+    def _is_comparison_query(self, query: str) -> bool:
+        """Detect comparison intent from query phrasing."""
+        query_lower = str(query or "").lower()
+        return re.search(
+            r"\b(compare|comparison|versus|vs|between|across|contrast)\b",
+            query_lower,
+        ) is not None
+
+    def _is_temporal_split_query(self, query: str) -> bool:
+        """Detect before/after time-split phrasing (for example, 'before and after 2018')."""
+        query_lower = str(query or "").lower()
+        if "before" not in query_lower or "after" not in query_lower:
+            return False
+        return bool(re.search(r"\b(19\d{2}|20\d{2})\b", query_lower))
+
+    def _extract_top_n_from_query(self, query: str, default: int = 10) -> int:
+        """Extract ranking limit from query text (for example, 'top 10')."""
+        query_lower = str(query or "").lower()
+        match = re.search(r"\btop\s+(\d{1,3})\b", query_lower)
+        if match:
+            try:
+                value = int(match.group(1))
+                return max(1, min(100, value))
+            except ValueError:
+                return default
+        if any(term in query_lower for term in ("highest", "lowest", "largest", "smallest", "best", "worst")):
+            return 1
+        return default
+
+    def _extract_target_year_from_query(self, query: str) -> Optional[int]:
+        """Extract explicit target year from query, if present."""
+        query_text = str(query or "")
+        years = [int(match) for match in re.findall(r"\b(19\d{2}|20\d{2})\b", query_text)]
+        if not years:
+            return None
+        # For ranking-like phrasing, the latest stated year is usually intended target.
+        return max(years)
+
+    def _build_distilled_indicator_query(self, query: str) -> str:
+        """
+        Distill a noisy natural-language query into a stable metric phrase.
+
+        This is used for cross-provider indicator resolution when the original
+        phrasing contains ranking/comparison scaffolding.
+        """
+        query_text = str(query or "").strip()
+        if not query_text:
+            return ""
+
+        query_lower = query_text.lower()
+        cues = self._extract_indicator_cues(query_lower)
+        if not cues:
+            return ""
+
+        ratio_patterns = [
+            "% of gdp",
+            "as % of gdp",
+            "as percent of gdp",
+            "as percentage of gdp",
+            "share of gdp",
+            "to gdp ratio",
+            "ratio to gdp",
+            "as share of gdp",
+        ]
+        has_ratio = any(pattern in query_lower for pattern in ratio_patterns)
+
+        if (
+            "trade_openness" in cues
+            or "trade openness" in query_lower
+            or "exports plus imports" in query_lower
+            or "export plus import" in query_lower
+        ):
+            return "trade openness ratio (exports plus imports to GDP)"
+        if "gdp_deflator" in cues:
+            return "GDP deflator inflation"
+        if "employment_population" in cues:
+            return "employment to population ratio"
+        if "producer_price" in cues:
+            return "producer price inflation"
+        if "house_prices" in cues:
+            return "house price index"
+        if "debt_service" in cues:
+            return "debt service ratio"
+        if "debt_gdp_ratio" in cues or "public_debt" in cues:
+            return "government debt (% of GDP)"
+        if "bond_yield" in cues:
+            if "long-term interest rate" in query_lower or "long term interest rate" in query_lower:
+                return "long-term interest rate"
+            if "tenor_30y" in cues:
+                return "30-year government bond yield"
+            if "tenor_10y" in cues:
+                return "10-year government bond yield"
+            if "tenor_2y" in cues:
+                return "2-year government bond yield"
+            return "government bond yield"
+        if "policy_rate" in cues:
+            return "policy rate"
+        if "money_supply" in cues:
+            if "m1" in query_lower:
+                return "M1 money supply"
+            if "m2" in query_lower:
+                return "M2 money supply"
+            if "m3" in query_lower:
+                return "M3 money supply"
+            return "money supply"
+        if "reserves" in cues:
+            return "foreign exchange reserves"
+        if "current_account" in cues:
+            return "current account balance (% of GDP)"
+        if "real_effective_exchange_rate" in cues:
+            return "real effective exchange rate"
+        if "exchange_rate" in cues:
+            return "exchange rate"
+        if "trade_balance" in cues:
+            if has_ratio:
+                return "trade balance (% of GDP)"
+            return "trade balance"
+        if "import" in cues:
+            if has_ratio:
+                return "imports as % of GDP"
+            return "imports"
+        if "export" in cues:
+            if has_ratio:
+                return "exports as % of GDP"
+            return "exports"
+        if "unemployment" in cues:
+            return "unemployment rate"
+        if "hicp" in cues:
+            return "HICP inflation"
+        if "inflation" in cues:
+            if "hicp" in query_lower:
+                return "HICP inflation"
+            if "cpi" in query_lower:
+                return "CPI inflation"
+            return "inflation rate"
+        if "credit" in cues:
+            return "private sector credit to GDP"
+        if "savings" in cues:
+            return "gross savings (% of GDP)"
+        if "gdp" in cues:
+            if "growth" in query_lower:
+                return "GDP growth"
+            if "per capita" in query_lower:
+                return "GDP per capita"
+            return "GDP"
+
+        return ""
+
+    def _infer_multi_concept_indicators_from_query(self, query: str) -> List[str]:
+        """Infer explicit indicator list for comparison queries spanning concept families."""
+        query_lower = str(query or "").lower()
+        cues = self._extract_indicator_cues(query_lower)
+        inferred: List[str] = []
+
+        if "employment_population" in cues:
+            inferred.append("employment to population ratio")
+        elif "unemployment" in cues:
+            inferred.append("unemployment rate")
+
+        if "producer_price" in cues:
+            inferred.append("producer price inflation")
+        elif "inflation" in cues:
+            inferred.append("HICP inflation" if "hicp" in query_lower else "inflation rate")
+
+        if "debt_service" in cues:
+            inferred.append("debt service ratio")
+        elif "debt_gdp_ratio" in cues or "public_debt" in cues:
+            inferred.append("government debt (% of GDP)")
+        elif "credit" in cues:
+            inferred.append("private sector credit to GDP")
+
+        if "policy_rate" in cues:
+            inferred.append("policy rate")
+        elif "bond_yield" in cues:
+            inferred.append("long-term interest rate")
+
+        if "money_supply" in cues:
+            inferred.append("money supply")
+
+        if "reserves" in cues:
+            inferred.append("foreign exchange reserves")
+        elif "current_account" in cues:
+            inferred.append("current account balance (% of GDP)")
+        elif "real_effective_exchange_rate" in cues:
+            inferred.append("real effective exchange rate")
+        elif "exchange_rate" in cues:
+            inferred.append("real effective exchange rate" if "reer" in query_lower else "exchange rate")
+
+        if "trade_balance" in cues:
+            inferred.append("trade balance (% of GDP)" if "gdp" in query_lower else "trade balance")
+        elif "import" in cues:
+            inferred.append("imports as % of GDP" if "gdp" in query_lower else "imports")
+        elif "export" in cues:
+            inferred.append("exports as % of GDP" if "gdp" in query_lower else "exports")
+
+        # Preserve order and uniqueness.
+        return list(dict.fromkeys([item for item in inferred if item]))
+
+    def _maybe_expand_multi_concept_intent(self, query: str, intent: ParsedIntent) -> bool:
+        """
+        Auto-expand clearly comparative multi-concept queries into multi-indicator intent.
+
+        This reduces unnecessary clarification loops for queries like
+        "compare unemployment and inflation for G7 countries".
+        """
+        if not intent:
+            return False
+        if intent.indicators and len(intent.indicators) > 1:
+            return False
+        if not (self._is_comparison_query(query) or self._is_ranking_query(query)):
+            return False
+
+        inferred_indicators = self._infer_multi_concept_indicators_from_query(query)
+        if len(inferred_indicators) < 2:
+            return False
+
+        target_countries = self._collect_target_countries(intent.parameters)
+        if len(target_countries) < 2:
+            extracted = self._extract_countries_from_query(query)
+            expanded = CountryResolver.expand_regions_in_query(query)
+            target_countries = extracted or expanded or target_countries
+        if len(target_countries) < 2:
+            return False
+
+        params = dict(intent.parameters or {})
+        params.pop("country", None)
+        params["countries"] = list(dict.fromkeys([str(country) for country in target_countries if country]))
+        params.pop("indicator", None)
+        params.pop("seriesId", None)
+        params.pop("series_id", None)
+        params.pop("code", None)
+
+        intent.parameters = params
+        intent.indicators = inferred_indicators
+        intent.clarificationNeeded = False
+        intent.clarificationQuestions = []
+
+        logger.info(
+            "🧩 Auto-expanded multi-concept comparison query into indicators=%s countries=%s",
+            inferred_indicators,
+            params.get("countries"),
+        )
+        return True
+
+    def _maybe_expand_ranking_country_scope(
+        self,
+        query: str,
+        provider: str,
+        params: dict,
+    ) -> dict:
+        """
+        Expand country scope for ranking queries that request top/highest/lowest
+        results without enough country context.
+
+        This keeps ranking in deterministic retrieval mode while avoiding single-
+        country defaults for broad ranking prompts.
+        """
+        if not params:
+            params = {}
+
+        query_text = str(query or "").strip()
+        if not query_text or not self._is_ranking_query(query_text):
+            return params
+        if params.get("_ranking_scope_expanded"):
+            return params
+
+        existing_targets = self._collect_target_countries(params)
+        if len(existing_targets) >= 2:
+            return params
+
+        expanded_countries: List[str] = []
+        query_lower = query_text.lower()
+
+        if len(existing_targets) == 1:
+            region_expansion = CountryResolver.expand_region(existing_targets[0])
+            if region_expansion and len(region_expansion) >= 2:
+                expanded_countries = region_expansion
+            else:
+                return params
+        else:
+            expanded_countries = CountryResolver.expand_regions_in_query(query_text)
+            if len(expanded_countries) < 2:
+                if re.search(r"\b(economy|economies|countries|nations)\b", query_lower):
+                    expanded_countries = sorted(CountryResolver.G20_MEMBERS)
+
+        if len(expanded_countries) < 2:
+            return params
+
+        normalized_provider = normalize_provider_name(provider)
+        if normalized_provider == "EUROSTAT":
+            expanded_countries = [
+                country for country in expanded_countries
+                if CountryResolver.is_eu_member(country)
+            ]
+
+        if len(expanded_countries) < 2:
+            return params
+
+        updated = dict(params)
+        updated.pop("country", None)
+        updated["countries"] = list(dict.fromkeys([str(country) for country in expanded_countries if country]))
+        updated["_ranking_scope_expanded"] = True
+
+        logger.info(
+            "📈 Expanded ranking scope to %d countries for provider %s",
+            len(updated.get("countries", [])),
+            normalized_provider or provider,
+        )
+        return updated
+
+    def _maybe_resolve_region_clarification(self, query: str, intent: ParsedIntent) -> bool:
+        """
+        Resolve parser-issued geography clarification when query already names known regions.
+
+        Example:
+        - "energy importers versus exporters" -> expand both groups to countries
+        """
+        if not intent or not intent.clarificationNeeded:
+            return False
+
+        expanded_countries = CountryResolver.expand_regions_in_query(query)
+        if len(expanded_countries) < 2:
+            return False
+
+        params = dict(intent.parameters or {})
+        params.pop("country", None)
+        params["countries"] = expanded_countries
+        intent.parameters = params
+
+        if not intent.indicators:
+            distilled = self._build_distilled_indicator_query(query)
+            if distilled:
+                intent.indicators = [distilled]
+        else:
+            query_cues = self._extract_indicator_cues(query)
+            if "current_account" in query_cues:
+                intent.indicators = ["current account balance (% of GDP)"]
+                params.pop("indicator", None)
+                intent.parameters = params
+
+        intent.clarificationNeeded = False
+        intent.clarificationQuestions = []
+
+        logger.info(
+            "🌍 Resolved region-based clarification using expanded countries: %s",
+            expanded_countries,
+        )
+        return True
+
+    def _maybe_resolve_temporal_comparison_clarification(self, query: str, intent: ParsedIntent) -> bool:
+        """
+        Resolve parser-issued temporal split clarifications for before/after queries.
+
+        Example:
+        - "contrast trade balances before and after 2018"
+        """
+        if not intent or not intent.clarificationNeeded:
+            return False
+
+        query_text = str(query or "").strip()
+        query_lower = query_text.lower()
+        if "before" not in query_lower or "after" not in query_lower:
+            return False
+
+        years = [int(match) for match in re.findall(r"\b(19\d{2}|20\d{2})\b", query_lower)]
+        if not years:
+            return False
+        split_year = max(years)
+
+        clarification_blob = " ".join(str(item) for item in (intent.clarificationQuestions or [])).lower()
+        if clarification_blob and not any(
+            token in clarification_blob
+            for token in ("before", "after", "period", "time range", "include the year", "from")
+        ):
+            return False
+
+        params = dict(intent.parameters or {})
+        if not params.get("startDate"):
+            params["startDate"] = f"{max(1960, split_year - 10)}-01-01"
+        if not params.get("endDate"):
+            from datetime import datetime
+
+            params["endDate"] = f"{max(split_year + 1, datetime.now().year)}-12-31"
+        params["comparisonSplitYear"] = split_year
+        intent.parameters = params
+
+        distilled = self._build_distilled_indicator_query(query_text)
+        if distilled:
+            intent.indicators = [distilled]
+
+        intent.clarificationNeeded = False
+        intent.clarificationQuestions = []
+
+        logger.info(
+            "🕒 Resolved temporal comparison clarification using split year %s (%s to %s)",
+            split_year,
+            params.get("startDate"),
+            params.get("endDate"),
+        )
+        return True
 
     def _extract_exchange_rate_params(self, params: dict, intent: ParsedIntent) -> dict:
         """
@@ -2030,6 +3695,8 @@ class QueryService:
                 for provider in all_providers:
                     if provider == primary_upper:
                         continue  # Skip the provider that failed
+                    if context_countries and not self._provider_covers_country_list(provider, context_countries):
+                        continue
 
                     # Check if this provider has the indicator
                     resolved = resolver.resolve(
@@ -2037,6 +3704,7 @@ class QueryService:
                         provider=provider,
                         country=country,
                         countries=context_countries or None,
+                        use_cache=False,
                     )
                     if resolved and resolved.confidence >= 0.6:
                         indicator_fallbacks.append((provider, resolved.confidence))
@@ -2282,6 +3950,17 @@ class QueryService:
             'gross', 'net', 'total', 'real', 'nominal'
         }
 
+        # Geography/context words should not dominate semantic relevance checks.
+        geo_terms: set[str] = set()
+        for alias in CountryResolver.COUNTRY_ALIASES.keys():
+            for token in re.findall(r"[a-z0-9]+", str(alias or "").lower()):
+                if len(token) >= 2:
+                    geo_terms.add(token)
+        for code in CountryResolver.COUNTRY_ALIASES.values():
+            token = str(code or "").strip().lower()
+            if token:
+                geo_terms.add(token)
+
         # Extract key terms from text
         def extract_key_terms(text: str) -> set:
             stop_words = {
@@ -2289,11 +3968,23 @@ class QueryService:
                 'index', 'rate', 'by', 'and', 'the', 'of', 'for', 'in', 'to',
                 'a', 'an', 'all', 'from', 'with', 'as', 'at', 'show', 'plot',
                 'get', 'find', 'display', 'chart', 'graph', 'value', 'values',
-                'economic', 'activity', 'activities'
+                'economic', 'activity', 'activities',
+                'trend', 'trends', 'historical', 'history', 'before', 'after',
+                'between', 'versus', 'vs', 'across', 'compare', 'comparison',
+                'contrast', 'since', 'last', 'past', 'latest',
             }
             terms = set()
-            for word in text.lower().replace('-', ' ').replace('_', ' ').split():
-                clean = ''.join(c for c in word if c.isalnum())
+            # Use regex tokenization so dotted/underscored provider codes
+            # (for example PX.REX.REER) preserve informative sub-tokens.
+            for clean in re.findall(r"[a-z0-9]+", text.lower().replace('-', ' ').replace('_', ' ')):
+                if not clean:
+                    continue
+                if clean.isdigit():
+                    continue
+                if re.fullmatch(r"(19|20)\d{2}", clean):
+                    continue
+                if clean in geo_terms:
+                    continue
                 if len(clean) > 2 and clean not in stop_words:
                     terms.add(clean)
             return terms
@@ -2308,9 +3999,39 @@ class QueryService:
             ] if part
         )
         original_terms = extract_key_terms(original_text)
+        original_cues = self._extract_indicator_cues(original_text)
+        high_signal_original_cues = {
+            cue for cue in original_cues
+            if cue not in {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+        }
 
         if not original_terms:
             return True  # Can't validate, accept fallback
+
+        # High-signal cue guardrail: fallback must preserve at least one key cue
+        # (for example, debt_gdp_ratio, bond_yield, import/export direction).
+        if high_signal_original_cues:
+            cue_overlap_found = False
+            for data in fallback_result:
+                if not data.metadata:
+                    continue
+                candidate_text = " ".join(
+                    [
+                        str(data.metadata.indicator or ""),
+                        str(data.metadata.seriesId or ""),
+                        str(data.metadata.description or ""),
+                    ]
+                )
+                candidate_cues = self._extract_indicator_cues(candidate_text)
+                if high_signal_original_cues & candidate_cues:
+                    cue_overlap_found = True
+                    break
+            if not cue_overlap_found:
+                logger.warning(
+                    "Fallback rejected: high-signal cue mismatch original=%s",
+                    sorted(high_signal_original_cues),
+                )
+                return False
 
         # Extract subjects and metrics from original
         original_subjects = original_terms & subject_entities
@@ -2323,6 +4044,13 @@ class QueryService:
                 continue
 
             result_text = (data.metadata.indicator or "").lower()
+            result_text = " ".join(
+                [
+                    result_text,
+                    str(data.metadata.seriesId or "").lower(),
+                    str(data.metadata.description or "").lower(),
+                ]
+            ).strip()
             result_terms = extract_key_terms(result_text)
 
             # Extract subjects and metrics from result
@@ -2458,6 +4186,7 @@ class QueryService:
             logger.warning(f"Attempting fallback from {primary_provider} to {fallback_provider}")
 
             fallback_params = dict(intent.parameters or {})
+            fallback_params["__fallback_excluded_providers"] = [primary_provider]
             # Remove provider-specific resolved indicator identifiers so fallback
             # providers can resolve indicator codes in their own namespace.
             fallback_params.pop("indicator", None)
@@ -2471,10 +4200,10 @@ class QueryService:
                 if not fallback_indicators:
                     fallback_indicators = [fallback_indicator_query]
                 elif len(fallback_indicators) == 1:
-                    existing_indicator = str(fallback_indicators[0] or "").strip().lower()
-                    current_param_indicator = str((intent.parameters or {}).get("indicator") or "").strip().lower()
-                    if existing_indicator and current_param_indicator and existing_indicator == current_param_indicator:
-                        fallback_indicators = [fallback_indicator_query]
+                    # Normalize to a semantic indicator phrase across providers.
+                    # This prevents provider-native source codes (for example IMF EREER)
+                    # from leaking into fallback providers with different code spaces.
+                    fallback_indicators = [fallback_indicator_query]
 
             # Create a modified intent for the fallback provider
             fallback_intent = ParsedIntent(
@@ -2533,12 +4262,23 @@ class QueryService:
             conv_id = conversation_manager.get_or_create(conversation_id)
             history = conversation_manager.get_history(conv_id) if conversation_id else []
 
+            pending_choice_response = await self._try_resolve_pending_indicator_choice(
+                query=query,
+                conversation_id=conv_id,
+                tracker=tracker,
+            )
+            if pending_choice_response is not None:
+                return pending_choice_response
+
             # Check if LangChain orchestrator should be used
             from ..config import get_settings
             settings = get_settings()
-            if allow_orchestrator and (use_orchestrator or settings.use_langchain_orchestrator):
+            bypass_orchestrator = self._is_temporal_split_query(query)
+            if allow_orchestrator and (use_orchestrator or settings.use_langchain_orchestrator) and not bypass_orchestrator:
                 logger.info("🤖 Using LangChain orchestrator for intelligent query routing")
                 return await self._execute_with_orchestrator(query, conv_id, tracker)
+            if bypass_orchestrator:
+                logger.info("⏭️ Bypassing orchestrator for temporal split query; using deterministic pipeline")
 
             # Early complexity detection (before LLM parsing)
             early_complexity = QueryComplexityAnalyzer.detect_complexity(query, intent=None)
@@ -2559,9 +4299,16 @@ class QueryService:
                     "indicators": intent.indicators,
                 })
 
+            # Framework enrichment: recover from avoidable parser clarifications and
+            # auto-expand clear multi-concept comparisons to multi-indicator intents.
+            self._maybe_resolve_region_clarification(query, intent)
+            self._maybe_resolve_temporal_comparison_clarification(query, intent)
+            self._maybe_expand_multi_concept_intent(query, intent)
+
             conv_id = conversation_manager.add_message_safe(conv_id, "user", query, intent=intent)
 
             if intent.clarificationNeeded:
+                conversation_manager.clear_pending_indicator_options(conv_id)
                 return QueryResponse(
                     conversationId=conv_id,
                     intent=intent,
@@ -2705,6 +4452,8 @@ class QueryService:
                     )
                     if fallback_data:
                         logger.info("✅ Fallback succeeded after empty primary response")
+                        fallback_data = self._rerank_data_by_query_relevance(query, fallback_data)
+                        fallback_data = self._apply_ranking_projection(query, fallback_data)
                         return QueryResponse(
                             conversationId=conv_id,
                             intent=intent,
@@ -2714,6 +4463,27 @@ class QueryService:
                         )
                 except Exception as fallback_exc:
                     logger.warning("Fallback after empty response failed: %s", fallback_exc)
+
+                # Semantic recovery pass before returning hard no-data.
+                recovered_data = await self._maybe_recover_from_empty_data(query, intent)
+                if recovered_data:
+                    logger.info("✅ Semantic recovery succeeded after empty primary response")
+                    return QueryResponse(
+                        conversationId=conv_id,
+                        intent=intent,
+                        data=recovered_data,
+                        clarificationNeeded=False,
+                        processingSteps=tracker.to_list(),
+                    )
+
+                no_data_clarification = self._build_no_data_indicator_clarification(
+                    conversation_id=conv_id,
+                    query=query,
+                    intent=intent,
+                    processing_steps=tracker.to_list(),
+                )
+                if no_data_clarification:
+                    return no_data_clarification
 
                 # Try to provide helpful context about why data might be missing
                 provider_name = intent.apiProvider
@@ -2740,6 +4510,14 @@ class QueryService:
                 )
 
             data = self._rerank_data_by_query_relevance(query, data)
+            data = self._apply_ranking_projection(query, data)
+            recovered_uncertain_data = await self._maybe_recover_from_uncertain_match(
+                query,
+                intent,
+                data,
+            )
+            if recovered_uncertain_data:
+                data = recovered_uncertain_data
             clarification_response = self._build_uncertain_result_clarification(
                 conversation_id=conv_id,
                 query=query,
@@ -2773,6 +4551,8 @@ class QueryService:
                     fallback_data = await self._try_with_fallback(intent, exc)
                     if fallback_data:
                         logger.info("✅ Fallback succeeded!")
+                        fallback_data = self._rerank_data_by_query_relevance(query, fallback_data)
+                        fallback_data = self._apply_ranking_projection(query, fallback_data)
                         return QueryResponse(
                             conversationId=conv_id,
                             intent=intent,
@@ -2782,6 +4562,15 @@ class QueryService:
                         )
                 except Exception as fallback_exc:
                     logger.warning("All fallback providers failed: %s", fallback_exc)
+
+            clarification_response = self._build_no_data_indicator_clarification(
+                conversation_id=conv_id,
+                query=query,
+                intent=intent if "intent" in locals() else None,
+                processing_steps=tracker.to_list(),
+            )
+            if clarification_response:
+                return clarification_response
 
             # Format error message with helpful context
             formatted_message = QueryComplexityAnalyzer.format_error_message(
@@ -2804,6 +4593,8 @@ class QueryService:
                     fallback_data = await self._try_with_fallback(intent, exc)
                     if fallback_data:
                         logger.info("✅ Fallback succeeded after error!")
+                        fallback_data = self._rerank_data_by_query_relevance(query, fallback_data)
+                        fallback_data = self._apply_ranking_projection(query, fallback_data)
                         return QueryResponse(
                             conversationId=conv_id,
                             intent=intent,
@@ -2835,6 +4626,9 @@ class QueryService:
         import asyncio
 
         all_data = []
+        explicit_provider = self._normalize_provider_alias(
+            self._detect_explicit_provider(intent.originalQuery or "")
+        )
 
         # Ensure default time periods are applied to base intent first
         if not intent.parameters.get("startDate") and not intent.parameters.get("endDate"):
@@ -2855,9 +4649,34 @@ class QueryService:
             if normalize_provider_name(intent.apiProvider) == "STATSCAN":
                 params["indicator"] = indicator
 
+            single_provider = normalize_provider_name(intent.apiProvider)
+            if explicit_provider:
+                single_provider = explicit_provider
+            else:
+                try:
+                    routing_intent = ParsedIntent(
+                        apiProvider=single_provider,
+                        indicators=[indicator],
+                        parameters=dict(params),
+                        clarificationNeeded=False,
+                        originalQuery=intent.originalQuery,
+                    )
+                    routed_provider = await self._select_routed_provider(
+                        routing_intent,
+                        f"{indicator} {intent.originalQuery or ''}".strip(),
+                    )
+                    if routed_provider:
+                        single_provider = routed_provider
+                except Exception as exc:
+                    logger.debug(
+                        "Multi-indicator provider routing failed for '%s': %s",
+                        indicator,
+                        exc,
+                    )
+
             # Create a new intent with single indicator
             single_intent = ParsedIntent(
-                apiProvider=intent.apiProvider,
+                apiProvider=single_provider,
                 indicators=[indicator],
                 parameters=params,
                 clarificationNeeded=False,
@@ -2903,7 +4722,19 @@ class QueryService:
 
         provider = normalize_provider_name(intent.apiProvider)
         params = intent.parameters or {}
+        fallback_excluded_providers = {
+            normalize_provider_name(str(candidate))
+            for candidate in (params.get("__fallback_excluded_providers") or [])
+            if candidate
+        }
+        fallback_excluded_providers.discard("")
         tracker = get_processing_tracker()
+
+        ranking_scope_query = str(intent.originalQuery or "").strip()
+        if not ranking_scope_query and intent.indicators:
+            ranking_scope_query = " ".join(str(indicator) for indicator in intent.indicators if indicator)
+        params = self._maybe_expand_ranking_country_scope(ranking_scope_query, provider, params)
+        intent.parameters = params
 
         provider, params = self._apply_concept_provider_override(provider, intent, params)
         intent.parameters = params
@@ -2961,11 +4792,8 @@ class QueryService:
                 if indicator_query:
                     country_context = params.get("country")
                     countries_context = params.get("countries") if isinstance(params.get("countries"), list) else None
-                    original_query_text = str(intent.originalQuery or "").strip()
-                    selected_original_override = (
-                        bool(original_query_text)
-                        and indicator_query == original_query_text
-                        and bool(intent.indicators)
+                    selected_query_override = (
+                        bool(intent.indicators)
                         and indicator_query != str(intent.indicators[0] or "").strip()
                     )
 
@@ -3002,10 +4830,10 @@ class QueryService:
                     if accepted_resolved and resolved:
                         params = {**params, "indicator": resolved.code}
                         # World Bank fetch path can iterate raw intent.indicators when multiple
-                        # are present. If we intentionally overrode to original query for better
-                        # semantic alignment, collapse to the resolved indicator to avoid
+                        # are present. If we intentionally overrode the parsed indicator query
+                        # for better semantic alignment, collapse to the resolved indicator to avoid
                         # reintroducing LLM-parsed mismatched indicators.
-                        if provider in {"WORLDBANK", "WORLD BANK"} and selected_original_override and len(intent.indicators) > 1:
+                        if provider in {"WORLDBANK", "WORLD BANK"} and selected_query_override and len(intent.indicators) > 1:
                             logger.info(
                                 "🔎 Collapsing World Bank multi-indicator intent to resolved indicator '%s' after semantic override",
                                 resolved.code,
@@ -3042,28 +4870,50 @@ class QueryService:
 
                     alt_provider, alt_code, _ = get_best_provider(concept, countries_ctx)
                     if alt_provider and alt_provider.upper() != provider:
-                        logger.info(
-                            "📋 Catalog: %s not available for '%s', routing to %s",
-                            provider,
-                            indicator_term,
-                            alt_provider,
-                        )
-                        intent.apiProvider = alt_provider
-                        provider = normalize_provider_name(alt_provider)
-
-                        if alt_code:
-                            params = {**params, "indicator": alt_code}
-                            intent.parameters = params
-                            if not intent.indicators or len(intent.indicators) == 1:
-                                intent.indicators = [alt_code]
+                        alt_provider_normalized = normalize_provider_name(alt_provider)
+                        if (
+                            fallback_excluded_providers
+                            and alt_provider_normalized
+                            and alt_provider_normalized != provider
+                        ):
                             logger.info(
-                                "📋 Catalog remapped indicator for %s: %s -> %s",
+                                "📋 Catalog reroute skipped in fallback context: keeping %s instead of %s",
+                                provider,
+                                alt_provider_normalized,
+                            )
+                        elif alt_provider_normalized in fallback_excluded_providers:
+                            logger.info(
+                                "📋 Catalog reroute skipped: candidate provider %s is blocked in this fallback context",
+                                alt_provider_normalized,
+                            )
+                        else:
+                            logger.info(
+                                "📋 Catalog: %s not available for '%s', routing to %s",
                                 provider,
                                 indicator_term,
-                                alt_code,
+                                alt_provider,
                             )
+                            intent.apiProvider = alt_provider
+                            provider = alt_provider_normalized
+
+                            if alt_code:
+                                params = {**params, "indicator": alt_code}
+                                intent.parameters = params
+                                if not intent.indicators or len(intent.indicators) == 1:
+                                    intent.indicators = [alt_code]
+                                logger.info(
+                                    "📋 Catalog remapped indicator for %s: %s -> %s",
+                                    provider,
+                                    indicator_term,
+                                    alt_code,
+                                )
             except Exception as e:
                 logger.warning(f"Catalog availability check failed: {e}")
+
+        internal_param_keys = {"__fallback_excluded_providers"}
+        if any(key in params for key in internal_param_keys):
+            params = {k: v for k, v in params.items() if k not in internal_param_keys}
+            intent.parameters = params
 
         # Apply smart default time ranges based on provider
         # This ensures Comtrade gets 10 years, ExchangeRate/CoinGecko gets 3 months
@@ -4114,6 +5964,11 @@ class QueryService:
                 data = result.get("data")  # Get actual data from orchestrator
                 query_type = result.get("query_type", "standard")
 
+                if isinstance(data, list) and data:
+                    self._normalize_bis_metadata_labels(data)
+                    data = self._rerank_data_by_query_relevance(query, data)
+                    data = self._apply_ranking_projection(query, data)
+
                 # Add to conversation history
                 conversation_id = conversation_manager.add_message_safe(
                     conversation_id,
@@ -4144,6 +5999,32 @@ class QueryService:
                             tracker,
                             record_user_message=False,
                         )
+
+                    recovery_intent = ParsedIntent(
+                        apiProvider=str(provider_name),
+                        indicators=list(indicators_list) if indicators_list else [query],
+                        parameters={"country": country} if country else {},
+                        clarificationNeeded=False,
+                        originalQuery=query,
+                    )
+                    recovered_data = await self._maybe_recover_from_empty_data(query, recovery_intent)
+                    if recovered_data:
+                        return QueryResponse(
+                            conversationId=conversation_id,
+                            intent=recovery_intent,
+                            data=recovered_data,
+                            clarificationNeeded=False,
+                            processingSteps=tracker.to_list() if tracker else None,
+                        )
+
+                    no_data_clarification = self._build_no_data_indicator_clarification(
+                        conversation_id=conversation_id,
+                        query=query,
+                        intent=recovery_intent,
+                        processing_steps=tracker.to_list() if tracker else None,
+                    )
+                    if no_data_clarification:
+                        return no_data_clarification
 
                     error_details = []
                     error_details.append(f"No data found for **{indicators}**")
@@ -4211,6 +6092,15 @@ class QueryService:
                         )
 
                 if data:
+                    if response.intent:
+                        recovered_uncertain_data = await self._maybe_recover_from_uncertain_match(
+                            query,
+                            response.intent,
+                            data,
+                        )
+                        if recovered_uncertain_data:
+                            data = recovered_uncertain_data
+                            response.data = data
                     clarification_response = self._build_uncertain_result_clarification(
                         conversation_id=conversation_id,
                         query=query,
@@ -4277,9 +6167,29 @@ class QueryService:
         has_ratio_query = any(pattern in query_lower for pattern in ratio_patterns)
         has_analysis_keyword = any(term in query_lower for term in analysis_keywords)
         query_cues = self._extract_indicator_cues(query_lower)
+        high_signal_query_cues = {
+            cue for cue in query_cues
+            if cue not in {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+        }
+        concept_groups = self._infer_query_concept_groups(query)
 
         if has_ratio_query and not has_analysis_keyword:
             logger.info("⏭️ Deep Agents skipped for single-metric ratio retrieval query")
+            return False
+
+        # Single-concept retrieval queries (even when ranking/comparison phrasing is
+        # present) are better served by deterministic fetching + framework ranking.
+        if (
+            (self._is_ranking_query(query) or self._is_comparison_query(query))
+            and len(concept_groups) <= 1
+            and len(high_signal_query_cues) <= 2
+            and not has_analysis_keyword
+        ):
+            logger.info(
+                "⏭️ Deep Agents skipped for single-concept retrieval query (concepts=%s, cues=%s)",
+                sorted(concept_groups),
+                sorted(high_signal_query_cues),
+            )
             return False
 
         if ("trade" in query_lower or "import" in query_lower or "export" in query_lower) and not has_analysis_keyword:
@@ -4442,6 +6352,7 @@ class QueryService:
                 data = _filter_valid_data(data)
                 self._normalize_bis_metadata_labels(data)
                 data = self._rerank_data_by_query_relevance(query, data)
+                data = self._apply_ranking_projection(query, data)
 
                 todos = result.get("todos", [])
                 message = None
@@ -4480,6 +6391,15 @@ class QueryService:
                         clarificationNeeded=False,
                         recommendedChartType="line",
                     )
+
+                if intent and data:
+                    recovered_uncertain_data = await self._maybe_recover_from_uncertain_match(
+                        query,
+                        intent,
+                        data,
+                    )
+                    if recovered_uncertain_data:
+                        data = recovered_uncertain_data
 
                 clarification_response = self._build_uncertain_result_clarification(
                     conversation_id=conversation_id,
@@ -4687,8 +6607,22 @@ class QueryService:
             # Handle Pro Mode result
             if result.get("is_pro_mode") and result.get("code_execution"):
                 code_exec = result["code_execution"]
+                code_output = str(code_exec.get("output", "") or "").strip()
+                raw_files = code_exec.get("files", []) or []
+                # Guardrail: accidental Pro Mode routing for retrieval queries can
+                # return empty code output and no datasets. Retry deterministic path.
+                if result.get("query_type") != "analysis" and not code_output and not raw_files:
+                    logger.warning(
+                        "LangGraph routed non-analysis query to Pro Mode without output. "
+                        "Retrying via standard pipeline."
+                    )
+                    return await self._standard_query_processing(
+                        query,
+                        conversation_id,
+                        tracker,
+                        record_user_message=False,
+                    )
                 # Convert file dicts to GeneratedFile objects
-                raw_files = code_exec.get("files", [])
                 files = None
                 if raw_files:
                     files = [gf for gf in (_coerce_generated_file(f) for f in raw_files) if gf is not None]
@@ -4712,12 +6646,17 @@ class QueryService:
                 self._normalize_bis_metadata_labels(data)
             if isinstance(data, list) and data:
                 data = self._rerank_data_by_query_relevance(query, data)
+                data = self._apply_ranking_projection(query, data)
 
             # Guardrail: if LangGraph returns data whose semantic cues do not
             # match high-signal cues from the original query (e.g., import vs debt),
             # retry through the standard deterministic path.
             if data:
                 query_cues = self._extract_indicator_cues(query)
+                high_signal_query_cues = {
+                    cue for cue in query_cues
+                    if cue not in {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+                }
                 result_cues: set[str] = set()
                 for series in data:
                     indicator_name = (
@@ -4727,11 +6666,11 @@ class QueryService:
                     )
                     result_cues |= self._extract_indicator_cues(indicator_name)
 
-                if query_cues and not (query_cues & result_cues):
+                if high_signal_query_cues and not (high_signal_query_cues & result_cues):
                     logger.warning(
-                        "LangGraph semantic cue mismatch (query=%s, result=%s). "
+                        "LangGraph semantic cue mismatch (high_signal_query=%s, result=%s). "
                         "Retrying via standard pipeline.",
-                        sorted(query_cues),
+                        sorted(high_signal_query_cues),
                         sorted(result_cues),
                     )
                     return await self._standard_query_processing(
@@ -4798,6 +6737,21 @@ class QueryService:
 
                 logger.warning(f"LangGraph: No data returned from {provider_name} for query")
 
+                recovery_intent = coerced_intent
+                if not recovery_intent:
+                    recovery_intent = self._coerce_parsed_intent(parsed_intent, query)
+                if recovery_intent:
+                    recovered_data = await self._maybe_recover_from_empty_data(query, recovery_intent)
+                    if recovered_data:
+                        logger.info("✅ LangGraph: Semantic recovery succeeded")
+                        return QueryResponse(
+                            conversationId=conversation_id,
+                            intent=recovery_intent,
+                            data=recovered_data,
+                            clarificationNeeded=False,
+                            processingSteps=tracker.to_list() if tracker else None,
+                        )
+
                 # Try fallback providers before giving up (same as standard path)
                 if coerced_intent and provider_name != "Unknown":
                     try:
@@ -4812,6 +6766,8 @@ class QueryService:
                         )
                         if fallback_data:
                             logger.info(f"✅ LangGraph: Fallback succeeded!")
+                            fallback_data = self._rerank_data_by_query_relevance(query, fallback_data)
+                            fallback_data = self._apply_ranking_projection(query, fallback_data)
                             # Return successful fallback data
                             return QueryResponse(
                                 conversationId=conversation_id,
@@ -4839,6 +6795,15 @@ class QueryService:
                         tracker,
                         record_user_message=False,
                     )
+
+                no_data_clarification = self._build_no_data_indicator_clarification(
+                    conversation_id=conversation_id,
+                    query=query,
+                    intent=coerced_intent,
+                    processing_steps=tracker.to_list() if tracker else None,
+                )
+                if no_data_clarification:
+                    return no_data_clarification
 
                 error_details = []
                 error_details.append(f"No data found for **{indicators}**")
@@ -4898,6 +6863,16 @@ class QueryService:
                         originalQuery=query,
                     )
 
+                if response.intent:
+                    recovered_uncertain_data = await self._maybe_recover_from_uncertain_match(
+                        query,
+                        response.intent,
+                        data,
+                    )
+                    if recovered_uncertain_data:
+                        data = recovered_uncertain_data
+                        response.data = data
+
                 clarification_response = self._build_uncertain_result_clarification(
                     conversation_id=conversation_id,
                     query=query,
@@ -4956,6 +6931,9 @@ class QueryService:
             parse_result = await self.pipeline.parse_and_route(query, history)
             intent = parse_result.intent
 
+        self._maybe_resolve_region_clarification(query, intent)
+        self._maybe_expand_multi_concept_intent(query, intent)
+
         if record_user_message:
             conversation_id = conversation_manager.add_message_safe(
                 conversation_id,
@@ -4989,7 +6967,44 @@ class QueryService:
             max_attempts=3,
             initial_delay=1.0,
         )
+        if not data:
+            recovered_data = await self._maybe_recover_from_empty_data(query, intent)
+            if recovered_data:
+                data = recovered_data
+        if not data:
+            provider_name = intent.apiProvider or "Unknown"
+            indicators = ", ".join(intent.indicators) if intent.indicators else "requested indicator"
+            country = intent.parameters.get("country") or intent.parameters.get("countries", [""])[0] if intent.parameters else ""
+            no_data_clarification = self._build_no_data_indicator_clarification(
+                conversation_id=conversation_id,
+                query=query,
+                intent=intent,
+                processing_steps=tracker.to_list() if tracker else None,
+            )
+            if no_data_clarification:
+                return no_data_clarification
+            details = [f"No data found for **{indicators}**"]
+            if country:
+                details.append(f"for **{country}**")
+            details.append(f"from **{provider_name}**.")
+            return QueryResponse(
+                conversationId=conversation_id,
+                intent=intent,
+                clarificationNeeded=False,
+                error="no_data_found",
+                message=f"⚠️ **No Data Available**\n\n{' '.join(details)}",
+                processingSteps=tracker.to_list() if tracker else None,
+            )
+
         data = self._rerank_data_by_query_relevance(query, data)
+        data = self._apply_ranking_projection(query, data)
+        recovered_uncertain_data = await self._maybe_recover_from_uncertain_match(
+            query,
+            intent,
+            data,
+        )
+        if recovered_uncertain_data:
+            data = recovered_uncertain_data
         clarification_response = self._build_uncertain_result_clarification(
             conversation_id=conversation_id,
             query=query,
@@ -5497,14 +7512,20 @@ class QueryService:
             List of NormalizedData objects or None if failed
         """
         try:
+            sub_params = {
+                **(original_intent.parameters or {}),
+                "entity": entity,  # Preserve for providers that support entity directly
+            }
+            if original_intent.decompositionType == "countries":
+                # Country decomposition must bind each sub-query to a single country.
+                sub_params["country"] = entity
+                sub_params.pop("countries", None)
+
             # Create a modified intent for this entity
             sub_intent = ParsedIntent(
                 apiProvider=original_intent.apiProvider,
                 indicators=original_intent.indicators,
-                parameters={
-                    **original_intent.parameters,
-                    "entity": entity  # Add entity to parameters for provider to use
-                },
+                parameters=sub_params,
                 clarificationNeeded=False,
                 needsDecomposition=False,  # Don't re-decompose
             )

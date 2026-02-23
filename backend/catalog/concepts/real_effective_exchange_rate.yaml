@@ -24,27 +24,27 @@ explicit_exclusions:
   - spot exchange rate
 
 providers:
-  BIS:
-    primary:
-      code: WS_XRU
-      name: "Effective exchange rate indices"
-      confidence: 0.92
-      coverage: global
-      frequency: monthly
-
   IMF:
     primary:
-      code: REAL_EFFECTIVE_EXCHANGE_RATE
+      code: EREER
       name: "Real Effective Exchange Rate"
-      confidence: 0.80
-      coverage: partial_global
+      confidence: 0.92
+      coverage: global
+      frequency: annual
+
+  WorldBank:
+    primary:
+      code: PX.REX.REER
+      name: "Real effective exchange rate index (2010 = 100)"
+      confidence: 0.90
+      coverage: global
       frequency: annual
 
   OECD:
     primary:
       code: REER
       name: "Real effective exchange rates"
-      confidence: 0.75
+      confidence: 0.86
       coverage: oecd_members
       frequency: monthly
 
@@ -52,3 +52,4 @@ not_available:
   - Comtrade
   - CoinGecko
   - ExchangeRate
+  - BIS

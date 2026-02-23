@@ -164,12 +164,13 @@ class QueryComplexityAnalyzer:
         limitation_type = None
         pro_mode_required = False
 
-        # Check for ranking queries (MUST use Pro Mode)
+        # Check for ranking queries.
+        # Ranking/sorting on retrieved data can be handled in standard mode via
+        # framework-level projection, so this alone does not require Pro Mode.
         has_ranking = any(re.search(pattern, query_lower) for pattern in QueryComplexityAnalyzer.RANKING_PATTERNS)
         if has_ranking:
             factors.append('ranking')
             limitation_type = 'multi_country_comparison'
-            pro_mode_required = True  # Rankings REQUIRE Pro Mode
 
         # Check for multi-country
         multi_country = any(re.search(pattern, query_lower) for pattern in QueryComplexityAnalyzer.MULTI_COUNTRY_PATTERNS)
@@ -266,6 +267,12 @@ class QueryComplexityAnalyzer:
 
         return {
             'is_complex': is_complex,
+            'is_ranking': has_ranking,
+            'is_multi_country': multi_country,
+            'is_calculation': has_calculation,
+            'is_multi_indicator': multi_indicator,
+            'is_regional_breakdown': regional,
+            'is_categorical_breakdown': categorical and not is_standard_breakdown,
             'complexity_factors': factors,
             'suggested_strategy': strategy,
             'pro_mode_recommended': pro_mode_recommended,

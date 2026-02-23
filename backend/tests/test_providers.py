@@ -15,6 +15,35 @@ from backend.tests.utils import MockAsyncClient, MockAsyncResponse, run
 
 
 class ProviderTests(unittest.TestCase):
+    def test_oecd_lookup_terms_prioritize_semantic_alias_for_short_code(self) -> None:
+        provider = OECDProvider()
+        terms = provider._build_indicator_lookup_terms("PPI")  # pylint: disable=protected-access
+
+        self.assertTrue(terms)
+        self.assertIn("ppi", [term.lower() for term in terms])
+        self.assertTrue(any("producer" in term.lower() for term in terms))
+        self.assertNotEqual(terms[0].upper(), "PPI")
+
+    def test_oecd_local_catalog_prefers_producer_price_flow_for_ppi_query(self) -> None:
+        provider = OECDProvider(metadata_search_service=None)
+        catalog = {
+            "DSD_NAMAIN10@DF_TABLE1_EXPENDITURE_CPC": {
+                "name": "National accounts price indicators",
+                "description": "Consumer expenditure price index",
+                "structure": "DSD_NAMAIN10",
+            },
+            "DSD_PRICES@DF_PPI": {
+                "name": "Producer price index",
+                "description": "Producer prices for industry",
+                "structure": "DSD_PRICES",
+            },
+        }
+
+        with patch.object(OECDProvider, "_load_dataflows_catalog", return_value=catalog):
+            _, dataflow, _ = run(provider._resolve_indicator("PPI"))  # pylint: disable=protected-access
+
+        self.assertEqual(dataflow, "DSD_PRICES@DF_PPI")
+
     def test_fred_series_id_mapping(self) -> None:
         """Test that indicator names are properly mapped to FRED series IDs."""
         provider = FREDProvider(api_key="test-key")
@@ -350,6 +379,36 @@ class ProviderTests(unittest.TestCase):
         self.assertIn("debt", label.lower())
         self.assertIn("gdp", label.lower())
 
+    def test_imf_fetch_batch_uses_alternative_code_when_primary_missing(self) -> None:
+        provider = IMFProvider(metadata_search_service=None)
+
+        responses = [
+            MockAsyncResponse({"values": {}}),
+            MockAsyncResponse(
+                {
+                    "values": {
+                        "PPPIA_IX": {
+                            "USA": {"2020": 100.0, "2021": 103.5},
+                            "DEU": {"2020": 99.1, "2021": 102.0},
+                        }
+                    }
+                }
+            ),
+        ]
+
+        with patch.object(provider, "_resolve_indicator_code", return_value=("PPI", "Producer Price Index")), \
+             patch.object(provider, "_get_alternative_indicator_codes", return_value=["PPPIA_IX"]), \
+             patch("backend.providers.imf.get_http_client", return_value=MockAsyncClient(responses)):
+            result = run(
+                provider.fetch_batch_indicator(
+                    indicator="producer price inflation",
+                    countries=["USA", "DEU"],
+                )
+            )
+
+        self.assertEqual(len(result), 2)
+        self.assertTrue(all(series.metadata.seriesId == "PPPIA_IX" for series in result))
+
     def test_bis_metadata_discovery(self) -> None:
         class StubMetadata:
             async def search_bis(self, keyword: str):
@@ -498,8 +557,44 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(agency, "OECD.SDD.TPS")
         self.assertEqual(dataflow, "DSD_IRLT@DF_IRLT")
         self.assertEqual(version, "1.0")
-        self.assertIn("IRLT", metadata_stub.search_terms)
+        self.assertIn("IRLT", [term.upper() for term in provider._build_indicator_lookup_terms("IRLT")])  # pylint: disable=protected-access
         self.assertTrue(any(term.lower() == "long-term interest rates" for term in metadata_stub.search_terms))
+
+    def test_oecd_fetch_multi_country_skips_aggregate_for_explicit_country_comparison(self) -> None:
+        provider = OECDProvider(metadata_search_service=None)
+        call_countries = []
+
+        async def _fake_fetch_indicator(indicator: str, country: str, start_year=None, end_year=None):
+            call_countries.append(country)
+            return NormalizedData.model_validate(
+                {
+                    "metadata": {
+                        "source": "OECD",
+                        "indicator": indicator,
+                        "country": country,
+                        "frequency": "annual",
+                        "unit": "%",
+                        "lastUpdated": "2024-01-01",
+                        "seriesId": "TEST",
+                    },
+                    "data": [{"date": "2023-01-01", "value": 1.0}],
+                }
+            )
+
+        with patch.object(provider, "fetch_indicator", new=AsyncMock(side_effect=_fake_fetch_indicator)):
+            results = run(
+                provider.fetch_multi_country(
+                    indicator="PPI",
+                    countries=["US", "DE"],
+                    start_year=2019,
+                    end_year=2024,
+                )
+            )
+
+        self.assertEqual(len(results), 2)
+        self.assertIn("USA", call_countries)
+        self.assertIn("DEU", call_countries)
+        self.assertNotIn("OECD", call_countries)
 
     def test_worldbank_does_not_expand_short_country_codes_as_groups(self) -> None:
         provider = WorldBankProvider()

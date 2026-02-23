@@ -4,7 +4,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..models import ParsedIntent
 
@@ -23,6 +23,7 @@ class ConversationContext:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_intent: Optional[ParsedIntent] = None
+    pending_indicator_options: Optional[Dict[str, Any]] = None
 
 
 class ConversationManager:
@@ -127,6 +128,34 @@ class ConversationManager:
                 {"role": msg.role, "content": msg.content}
                 for msg in list(conversation.messages)
             ]
+
+    def set_pending_indicator_options(self, conversation_id: str, payload: Dict[str, Any]) -> None:
+        """Persist pending indicator-choice clarification options for a conversation."""
+        with self._lock:
+            conversation = self._get_locked(conversation_id)
+            if not conversation:
+                raise ValueError("Conversation not found")
+
+            conversation.pending_indicator_options = dict(payload or {})
+            conversation.updated_at = self._now()
+
+    def get_pending_indicator_options(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        """Get pending indicator-choice clarification payload if present."""
+        with self._lock:
+            conversation = self._get_locked(conversation_id)
+            if not conversation:
+                return None
+            pending = conversation.pending_indicator_options
+            return dict(pending) if isinstance(pending, dict) else None
+
+    def clear_pending_indicator_options(self, conversation_id: str) -> None:
+        """Clear pending indicator-choice clarification state."""
+        with self._lock:
+            conversation = self._get_locked(conversation_id)
+            if not conversation:
+                return
+            conversation.pending_indicator_options = None
+            conversation.updated_at = self._now()
 
     def get_or_create(self, conversation_id: Optional[str]) -> str:
         """

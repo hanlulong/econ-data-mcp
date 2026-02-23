@@ -408,6 +408,11 @@ class CountryResolver:
         "PK", "TH", "TR", "VN",
     })
 
+    # Small open economies (representative set used in macro comparisons)
+    SMALL_OPEN_ECONOMIES_MEMBERS: FrozenSet[str] = frozenset({
+        "BE", "CH", "DK", "EE", "IE", "IS", "LU", "NL", "NO", "NZ", "SG",
+    })
+
     # MERCOSUR - Southern Common Market (infrastructure fix for session 11)
     MERCOSUR_MEMBERS: FrozenSet[str] = frozenset({
         "AR", "BR", "PY", "UY",  # Full members: Argentina, Brazil, Paraguay, Uruguay
@@ -890,6 +895,11 @@ class CountryResolver:
             "ENERGY_IMPORTING_COUNTRIES": cls.ENERGY_IMPORTERS_MEMBERS,
             "NET_ENERGY_IMPORTERS": cls.ENERGY_IMPORTERS_MEMBERS,
             "OIL_IMPORTERS": cls.ENERGY_IMPORTERS_MEMBERS,
+            # Small open economies
+            "SMALL_OPEN_ECONOMIES": cls.SMALL_OPEN_ECONOMIES_MEMBERS,
+            "SMALL_OPEN_ECONOMY": cls.SMALL_OPEN_ECONOMIES_MEMBERS,
+            "SMALL_OPEN_COUNTRIES": cls.SMALL_OPEN_ECONOMIES_MEMBERS,
+            "SMALL_OPEN_NATIONS": cls.SMALL_OPEN_ECONOMIES_MEMBERS,
             # MERCOSUR - Southern Common Market (infrastructure fix session 11)
             "MERCOSUR": cls.MERCOSUR_MEMBERS,
             "MERCOSUR_COUNTRIES": cls.MERCOSUR_MEMBERS,
@@ -1110,6 +1120,10 @@ class CountryResolver:
             ("energy exporting countries", "ENERGY_EXPORTERS"),
             ("net energy exporters", "ENERGY_EXPORTERS"),
             ("oil exporters", "ENERGY_EXPORTERS"),
+            ("small open economies", "SMALL_OPEN_ECONOMIES"),
+            ("small open economy", "SMALL_OPEN_ECONOMIES"),
+            ("small open countries", "SMALL_OPEN_ECONOMIES"),
+            ("small open nations", "SMALL_OPEN_ECONOMIES"),
             # EU needs word boundary check to avoid matching "euro" or "neutral"
         ]
 

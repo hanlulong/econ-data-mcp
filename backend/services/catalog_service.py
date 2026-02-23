@@ -452,11 +452,22 @@ def _check_coverage(coverage: Any, countries: Optional[List[str]]) -> bool:
             return normalized
         return CountryResolver.to_iso2(str(country).upper())
 
+    if isinstance(coverage, list):
+        coverage_upper = {
+            (CountryResolver.normalize(c) or str(c).upper())
+            for c in coverage
+            if c
+        }
+        return all(
+            (CountryResolver.normalize(c) or str(c).upper()) in coverage_upper
+            for c in countries
+        )
+
     if isinstance(coverage, str):
         # Strip inline comments in YAML values like "OECD  # ...".
         coverage_normalized = coverage.split("#", 1)[0].strip().lower()
     else:
-        coverage_normalized = coverage
+        coverage_normalized = str(coverage or "").strip().lower()
 
     if coverage_normalized in {"global", "partial_global"}:
         return True
@@ -477,10 +488,6 @@ def _check_coverage(coverage: Any, countries: Optional[List[str]]) -> bool:
         except Exception:
             # Fail open for coverage hints when BIS module is unavailable.
             return True
-
-    if isinstance(coverage, list):
-        coverage_upper = {(CountryResolver.normalize(c) or str(c).upper()) for c in coverage}
-        return all((CountryResolver.normalize(c) or str(c).upper()) in coverage_upper for c in countries)
 
     return False
 

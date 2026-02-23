@@ -1,0 +1,54 @@
+# HICP Inflation Indicator Catalog
+concept: hicp_inflation
+category: prices
+domain: macroeconomics
+
+description: |
+  Harmonised Index of Consumer Prices (HICP) inflation used for cross-country
+  comparability in Europe.
+
+synonyms:
+  primary:
+    - hicp
+    - hicp inflation
+    - harmonized inflation
+    - harmonised inflation
+    - harmonized index of consumer prices
+    - harmonised index of consumer prices
+  secondary:
+    - eu inflation
+    - euro area hicp
+    - eurozone hicp
+    - euro area inflation
+
+explicit_exclusions:
+  - cpi inflation
+  - consumer price inflation
+  - gdp deflator
+  - producer price inflation
+
+providers:
+  Eurostat:
+    primary:
+      code: prc_hicp_aind
+      name: "HICP - annual data (average index and rate of change)"
+      confidence: 0.96
+      coverage: eu_members
+      frequency: annual
+
+  OECD:
+    primary:
+      code: DSD_PRICES@DF_PRICES_HICP
+      name: "Eurostat harmonised index of consumer prices (HICP)"
+      confidence: 0.88
+      coverage: oecd_members
+      frequency: monthly
+
+not_available:
+  - WorldBank
+  - IMF
+  - FRED
+  - StatsCan
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate

@@ -17,13 +17,18 @@ synonyms:
     - price increase
     - cost of living
     - consumer price index
-    - hicp
     - price growth
     - rising prices
 
 explicit_exclusions:
   - deflation
   - disinflation
+  - gdp deflator
+  - hicp
+  - harmonized index of consumer prices
+  - producer price inflation
+  - producer prices
+  - ppi inflation
   - price index level
   - price index value
   - base year prices

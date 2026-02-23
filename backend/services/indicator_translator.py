@@ -15,6 +15,7 @@ Date: 2025-11-29
 from __future__ import annotations
 
 import logging
+import re
 from typing import Dict, List, Optional, Tuple
 from difflib import SequenceMatcher
 
@@ -117,6 +118,26 @@ class IndicatorTranslator:
                 "BIS": ["WS_LONG_CPI"],
                 "STATSCAN": ["41690914"],
             }
+        },
+        "producer_price_inflation": {
+            "aliases": [
+                "producer price inflation",
+                "producer prices",
+                "producer price index",
+                "ppi",
+                "ppi inflation",
+                "wholesale price inflation",
+            ],
+            "imf_codes": [],
+            "providers": {
+                "FRED": ["PPIACO"],
+                "WORLDBANK": ["FP.WPI.TOTL.ZG"],
+                "IMF": [],
+                "EUROSTAT": [],
+                "OECD": ["PPI"],
+                "BIS": [],
+                "STATSCAN": [],
+            },
         },
 
         # Debt and Credit
@@ -224,8 +245,7 @@ class IndicatorTranslator:
                        "repo rate", "official rate", "key rate", "discount rate",
                        "monetary policy rate", "bank rate", "lending rate",
                        "ecb rate", "boe rate", "rba rate", "overnight rate",
-                       "real interest rate", "nominal interest rate",
-                       "government bond yield", "long term interest rate"],
+                       "real interest rate", "nominal interest rate"],
             "imf_codes": [],
             "providers": {
                 "FRED": ["FEDFUNDS", "DFEDTARU"],
@@ -237,20 +257,89 @@ class IndicatorTranslator:
                 "STATSCAN": [],
             }
         },
+        "bond_yield": {
+            "aliases": [
+                "bond yield",
+                "government bond yield",
+                "sovereign yield",
+                "treasury yield",
+                "10-year yield",
+                "10 year yield",
+                "long-term interest rate",
+                "long term interest rate",
+            ],
+            "imf_codes": ["RLTIR"],
+            "providers": {
+                "FRED": ["DGS10"],
+                "WORLDBANK": [],
+                "IMF": ["rltir"],
+                "EUROSTAT": [],
+                "OECD": ["IRLT"],
+                "BIS": [],
+                "STATSCAN": [],
+            },
+        },
 
         # Trade
         "trade_balance": {
-            "aliases": ["trade balance", "trade deficit", "net exports", "external balance"],
-            "imf_codes": ["BCA", "BCA_NGDPD"],
+            "aliases": [
+                "trade balance",
+                "trade deficit",
+                "trade surplus",
+                "net exports",
+                "external balance",
+                "trade balance as share of gdp",
+                "trade balance % of gdp",
+            ],
+            "imf_codes": ["BT_GDP"],
             "providers": {
                 "FRED": ["BOPGSTB"],
                 "WORLDBANK": ["NE.RSB.GNFS.ZS"],
-                "IMF": ["BCA_NGDPD"],
+                "IMF": ["BT_GDP"],
                 "EUROSTAT": ["tet00034"],
                 "OECD": [],
                 "BIS": [],
                 "STATSCAN": [],
             }
+        },
+        "trade_openness": {
+            "aliases": [
+                "trade openness",
+                "trade openness ratio",
+                "trade to gdp ratio",
+                "trade as percent of gdp",
+                "exports plus imports to gdp",
+                "imports plus exports to gdp",
+            ],
+            "imf_codes": ["BFA_BOP_B_XS_GDP_PT"],
+            "providers": {
+                "FRED": [],
+                "WORLDBANK": ["NE.TRD.GNFS.ZS"],
+                "IMF": ["BFA_BOP_B_XS_GDP_PT"],
+                "EUROSTAT": [],
+                "OECD": [],
+                "BIS": [],
+                "STATSCAN": [],
+            },
+        },
+        "current_account": {
+            "aliases": [
+                "current account",
+                "current account balance",
+                "current account deficit",
+                "current account surplus",
+                "balance of payments current account",
+            ],
+            "imf_codes": ["BCA_NGDPD"],
+            "providers": {
+                "FRED": [],
+                "WORLDBANK": ["BN.CAB.XOKA.GD.ZS"],
+                "IMF": ["BCA_NGDPD"],
+                "EUROSTAT": [],
+                "OECD": ["B6BLTT"],
+                "BIS": [],
+                "STATSCAN": [],
+            },
         },
         "exports": {
             "aliases": ["exports", "export", "goods exports", "merchandise exports"],
@@ -314,19 +403,37 @@ class IndicatorTranslator:
 
         # Exchange Rates
         "exchange_rate": {
-            "aliases": ["exchange rate", "forex", "currency", "fx rate",
-                       "effective exchange rate"],
-            "imf_codes": ["EREER"],
+            "aliases": ["exchange rate", "forex", "currency", "fx rate", "currency conversion"],
+            "imf_codes": [],
             "providers": {
                 "FRED": ["DEXUSEU"],
                 "WORLDBANK": ["PA.NUS.FCRF"],
-                "IMF": ["EREER"],
+                "IMF": [],
                 "EUROSTAT": [],
                 "OECD": [],
                 "BIS": ["WS_XRU"],
                 "EXCHANGERATE": ["rates"],
                 "STATSCAN": [],
             }
+        },
+        "real_effective_exchange_rate": {
+            "aliases": [
+                "real effective exchange rate",
+                "reer",
+                "trade weighted real exchange rate",
+                "real effective fx",
+            ],
+            "imf_codes": ["EREER"],
+            "providers": {
+                "FRED": [],
+                "WORLDBANK": ["PX.REX.REER"],
+                "IMF": ["EREER"],
+                "EUROSTAT": [],
+                "OECD": ["REER"],
+                "BIS": [],
+                "EXCHANGERATE": [],
+                "STATSCAN": [],
+            },
         },
         "labor_force_participation": {
             "aliases": [
@@ -527,7 +634,17 @@ class IndicatorTranslator:
         self._alias_to_concept: Dict[str, str] = {}
         for concept_name, concept_data in self.UNIVERSAL_CONCEPTS.items():
             for alias in concept_data.get("aliases", []):
-                self._alias_to_concept[alias.lower()] = concept_name
+                normalized_alias = self._normalize_text_for_matching(alias)
+                if normalized_alias:
+                    self._alias_to_concept[normalized_alias] = concept_name
+
+    @staticmethod
+    def _normalize_text_for_matching(text: str) -> str:
+        """Normalize indicator text for robust alias matching."""
+        normalized = str(text or "").lower().replace("_", " ")
+        normalized = re.sub(r"[^a-z0-9\s]+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
 
     def is_imf_code(self, indicator: str) -> bool:
         """Check if the indicator looks like an IMF code."""
@@ -629,11 +746,46 @@ class IndicatorTranslator:
         Short queries need stricter matching because small character differences
         have disproportionate impact on similarity scores.
         """
-        indicator_lower = indicator.lower().replace("_", " ")
+        indicator_lower = self._normalize_text_for_matching(indicator)
+        if not indicator_lower:
+            return None
 
         # Direct match first
         if indicator_lower in self._alias_to_concept:
             return self._alias_to_concept[indicator_lower]
+
+        # Phrase/token containment matching for long natural-language requests:
+        # "producer price inflation trend in the us and germany" -> producer_price_inflation
+        # "trade openness ratio ... in small open economies" -> trade_openness
+        indicator_tokens = set(indicator_lower.split())
+        best_containment_concept = None
+        best_containment_score = 0.0
+
+        for alias, concept in self._alias_to_concept.items():
+            if not alias:
+                continue
+            alias_tokens = alias.split()
+            if not alias_tokens:
+                continue
+
+            # Require whole-word alias containment to avoid partial-token matches.
+            alias_pattern = rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])"
+            contains_alias = re.search(alias_pattern, indicator_lower) is not None
+            token_subset_match = len(alias_tokens) >= 2 and set(alias_tokens).issubset(indicator_tokens)
+
+            if not contains_alias and not token_subset_match:
+                continue
+
+            # Prefer more specific aliases (more tokens + longer phrase).
+            score = float(len(alias_tokens) * 10 + len(alias))
+            if token_subset_match and not contains_alias:
+                score *= 0.92
+            if score > best_containment_score:
+                best_containment_score = score
+                best_containment_concept = concept
+
+        if best_containment_concept:
+            return best_containment_concept
 
         # INFRASTRUCTURE FIX: Higher threshold for short queries
         # "m2 growth" (9 chars) vs "gdp growth" (10 chars) = 0.737 similarity

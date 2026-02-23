@@ -16,20 +16,35 @@ synonyms:
     - trade deficit
     - external balance
     - trade gap
+    - net trade balance
+    - trade balance as share of gdp
+    - trade balance (% of gdp)
+    - net trade balance as share of gdp
 
 explicit_exclusions:
   - trade volume
   - total trade
   - exports
   - imports
-  - trade as percent of gdp
 
 providers:
   WorldBank:
     primary:
-      code: BN.GSR.GNFS.CD
-      name: "External balance on goods and services"
-      confidence: 0.90
+      code: NE.RSB.GNFS.ZS
+      name: "External balance on goods and services (% of GDP)"
+      confidence: 0.95
+      coverage: global
+      frequency: annual
+    alternates:
+      - code: BN.GSR.GNFS.CD
+        name: "External balance on goods and services (current US$)"
+        confidence: 0.86
+
+  IMF:
+    primary:
+      code: BT_GDP
+      name: "Trade balance (% of GDP)"
+      confidence: 0.88
       coverage: global
       frequency: annual
 

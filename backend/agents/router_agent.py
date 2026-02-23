@@ -103,13 +103,14 @@ class RouterAgent:
         r"\bpercentage\s+change\b",
         r"\bcorrelation\b",
         r"\btrend\s+analysis\b",
-        r"\bforecast\b",
-        r"\bproject(ion)?\b",
         r"\bregression\b",
         r"\bstatistical\b",
         r"\baverage\s+of\b",
         r"\bsum\s+of\b",
         r"\bratio\s+of\b",
+        # Explicit forecasting intent (not just "forecast-style series").
+        r"\b(?:run|build|create|generate|do)\s+(?:a\s+)?forecast\b",
+        r"\b(?:forecast|project|predict)\s+(?:the\s+)?(?:next|future|path|trajectory|scenario|trend)\b",
         # More specific patterns that truly indicate calculation requests
         r"\bcalculate\s+(?:the\s+)?(?:growth|change|rate)\b",
         r"\bcompute\s+(?:the\s+)?(?:growth|change|rate)\b",

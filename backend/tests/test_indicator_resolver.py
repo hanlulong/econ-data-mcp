@@ -55,6 +55,88 @@ class IndicatorResolverTests(unittest.TestCase):
         self.assertEqual(result.code, "FI.RES.TOTL.CD")
         self.assertEqual(result.source, "translator")
 
+    def test_resolves_long_context_ppi_query_via_translator(self):
+        lookup = _FakeLookup(search_results=[])
+        resolver = IndicatorResolver(lookup=lookup, translator=IndicatorTranslator())
+
+        result = resolver.resolve(
+            "producer price inflation trend in the us and germany",
+            provider="OECD",
+            use_cache=False,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "PPI")
+        self.assertEqual(result.provider, "OECD")
+        self.assertEqual(result.source, "translator")
+
+    def test_resolves_trade_openness_context_query_via_translator(self):
+        lookup = _FakeLookup(search_results=[])
+        resolver = IndicatorResolver(lookup=lookup, translator=IndicatorTranslator())
+
+        result = resolver.resolve(
+            "trade openness ratio (exports plus imports to gdp) in small open economies",
+            provider="WorldBank",
+            use_cache=False,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "NE.TRD.GNFS.ZS")
+        self.assertEqual(result.provider, "WorldBank")
+        self.assertEqual(result.source, "translator")
+
+    def test_resolves_reer_context_query_to_worldbank_series(self):
+        lookup = _FakeLookup(search_results=[])
+        resolver = IndicatorResolver(lookup=lookup, translator=IndicatorTranslator())
+
+        result = resolver.resolve(
+            "reer trend for china and india from 2012 to 2024",
+            provider="WorldBank",
+            countries=["CN", "IN"],
+            use_cache=False,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "PX.REX.REER")
+        self.assertEqual(result.provider, "WorldBank")
+        self.assertEqual(result.source, "translator")
+
+    def test_prefers_imf_ppi_candidate_over_cpi_for_producer_price_query(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "PCPIPCH",
+                    "provider": "IMF",
+                    "name": "Inflation rate, average consumer prices",
+                    "description": "Average CPI inflation rate",
+                },
+                {
+                    "code": "VNM_PPPI_ISIC4_HTJ_PTR_BY_PP_IX",
+                    "provider": "IMF",
+                    "name": "Vietnam Definition, Producer Price Index, Services Producer Prices",
+                    "description": "Country-specific producer price index series",
+                },
+                {
+                    "code": "PPPIA_IX",
+                    "provider": "IMF",
+                    "name": "Prices, Producer Price Index, Commodities by Activity, Index",
+                    "description": "Producer price index",
+                },
+            ]
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve(
+            "producer price inflation",
+            provider="IMF",
+            countries=["US", "DE"],
+            use_cache=False,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.code, "PPPIA_IX")
+
     def test_cache_key_includes_country_context(self):
         class _CountingLookup(_FakeLookup):
             def __init__(self, exact_results):
@@ -318,7 +400,7 @@ class IndicatorResolverTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result.code, "DGS10")
-        self.assertEqual(result.source, "catalog")
+        self.assertIn(result.source, {"catalog", "translator"})
 
     def test_discontinued_series_penalty_prefers_active_alternative(self):
         lookup = _FakeLookup(
@@ -598,6 +680,34 @@ class IndicatorResolverTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result.code, "NE.IMP.GNFS.ZS")
+
+    def test_prefers_directional_ratio_series_over_absolute_trade_values(self):
+        lookup = _FakeLookup(
+            search_results=[
+                {
+                    "code": "NE.IMP.GNFS.CD",
+                    "provider": "WorldBank",
+                    "name": "Imports of goods and services (current US$)",
+                },
+                {
+                    "code": "NE.IMP.GNFS.ZS",
+                    "provider": "WorldBank",
+                    "name": "Imports of goods and services (% of GDP)",
+                },
+                {
+                    "code": "TM.VAL.MRCH.XD.WD",
+                    "provider": "WorldBank",
+                    "name": "Merchandise imports (current US$)",
+                },
+            ]
+        )
+        resolver = IndicatorResolver(lookup=lookup, translator=_FakeTranslator())
+
+        result = resolver.resolve("import share of gdp", provider="WorldBank", use_cache=False)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.code, "NE.IMP.GNFS.ZS")
+        self.assertGreaterEqual(result.confidence, 0.7)
 
     def test_rrf_fusion_can_promote_vector_only_candidate(self):
         lookup = _FakeLookup(

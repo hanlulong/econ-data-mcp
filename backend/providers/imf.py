@@ -769,7 +769,34 @@ class IMFProvider(BaseProvider):
 
         # Extract data for the indicator
         if "values" not in payload or indicator_code not in payload["values"]:
-            raise DataNotAvailableError(f"IMF indicator {indicator_code} not found in response")
+            alternative_codes = self._get_alternative_indicator_codes(
+                indicator=indicator,
+                primary_code=indicator_code,
+                requested_country_codes=country_codes,
+            )
+            for alternative_code in alternative_codes:
+                alt_url = f"{self.base_url}/{alternative_code}"
+                try:
+                    alt_response = await self._retry_request(alt_url, max_retries=2, initial_delay=0.6)
+                    alt_payload = alt_response.json()
+                except Exception:
+                    continue
+
+                if "values" in alt_payload and alternative_code in alt_payload["values"]:
+                    logger.info(
+                        "IMF indicator fallback resolved %s -> %s for query '%s'",
+                        indicator_code,
+                        alternative_code,
+                        indicator,
+                    )
+                    indicator_code = alternative_code
+                    indicator_label = self._friendly_indicator_label(indicator, alternative_code)
+                    payload = alt_payload
+                    break
+            else:
+                raise DataNotAvailableError(
+                    f"IMF indicator {indicator_code} not found in response"
+                )
 
         all_country_data = payload["values"][indicator_code]
 
@@ -861,6 +888,7 @@ class IMFProvider(BaseProvider):
                 frequency="annual",
                 unit=unit,
                 lastUpdated="",  # IMF doesn't provide last updated date in DataMapper
+                seriesId=indicator_code,
                 apiUrl=api_url,
                 sourceUrl=source_url,
                 seasonalAdjustment=None,  # IMF DataMapper data is typically not seasonally adjusted
@@ -943,6 +971,77 @@ class IMFProvider(BaseProvider):
             ]
 
         return data
+
+    def _get_alternative_indicator_codes(
+        self,
+        indicator: str,
+        primary_code: str,
+        requested_country_codes: Optional[List[str]] = None,
+        limit: int = 8,
+    ) -> List[str]:
+        """
+        Find alternative IMF indicator codes when the primary candidate is unavailable.
+
+        This is a general framework fallback:
+        - prefers provider-native codes from indicator lookup search
+        - de-prioritizes country-prefixed series for multi-country queries
+        - keeps producer-price queries in the producer-price family
+        """
+        requested_country_codes = [str(code or "").upper() for code in (requested_country_codes or []) if code]
+        primary_upper = str(primary_code or "").upper().strip()
+
+        seed_codes: List[str] = []
+        if primary_upper:
+            seed_codes.append(primary_upper)
+            if ":" in primary_upper:
+                seed_codes.append(primary_upper.split(":", 1)[1])
+
+        try:
+            from ..services.indicator_lookup import get_indicator_lookup
+
+            lookup = get_indicator_lookup()
+            search_results = lookup.search(indicator, provider="IMF", limit=20)
+        except Exception as exc:
+            logger.debug("IMF alternative indicator lookup failed: %s", exc)
+            search_results = []
+
+        producer_price_query = any(
+            token in str(indicator or "").lower()
+            for token in ("producer", "ppi", "wholesale")
+        )
+
+        preferred: List[str] = []
+        secondary: List[str] = []
+        seen: set[str] = set()
+
+        def _record(code_value: Optional[str]) -> None:
+            code = str(code_value or "").upper().strip()
+            if not code or code in seen or code in seed_codes:
+                return
+
+            country_prefix = re.match(r"^([A-Z]{3})_", code)
+            if country_prefix and requested_country_codes:
+                if country_prefix.group(1) not in requested_country_codes:
+                    return
+
+            seen.add(code)
+            if producer_price_query and not any(token in code for token in ("PPI", "PPPI", "PWPI")):
+                secondary.append(code)
+                return
+
+            preferred.append(code)
+
+        for seed in seed_codes[1:]:
+            _record(seed)
+        for candidate in search_results:
+            _record(candidate.get("code"))
+
+        if producer_price_query:
+            # For producer-price requests, fail closed rather than silently
+            # drifting to consumer-price substitutes.
+            return preferred[:limit]
+
+        return (preferred + secondary)[:limit]
 
     async def _resolve_indicator_code(self, indicator: str) -> tuple[str, Optional[str]]:
         """Resolve IMF indicator code through hardcoded mappings, translator, or metadata search."""

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from backend.services.catalog_service import find_concept_by_term, get_best_provider, reload_catalog
+from backend.services.catalog_service import (
+    find_concept_by_term,
+    get_best_provider,
+    get_indicator_code,
+    reload_catalog,
+)
 
 
 def test_debt_service_ratio_maps_to_debt_service_concept():
@@ -57,6 +62,24 @@ def test_wages_query_maps_to_wages_concept():
     assert concept == "wages"
 
 
+def test_gdp_deflator_query_maps_to_gdp_deflator_concept():
+    reload_catalog()
+    concept = find_concept_by_term("GDP deflator inflation in Germany between 2012 and 2024")
+    assert concept == "gdp_deflator"
+
+
+def test_hicp_query_maps_to_hicp_inflation_concept():
+    reload_catalog()
+    concept = find_concept_by_term("HICP inflation in euro area countries 2019 to 2024")
+    assert concept == "hicp_inflation"
+
+
+def test_current_account_query_maps_to_current_account_concept():
+    reload_catalog()
+    concept = find_concept_by_term("Compare current account balances for energy importers versus exporters")
+    assert concept == "current_account"
+
+
 def test_get_best_provider_handles_oecd_coverage_labels_with_comments():
     reload_catalog()
     provider, code, _ = get_best_provider("gdp_growth", countries=["CA"], preferred_provider="OECD")
@@ -69,3 +92,23 @@ def test_get_best_provider_handles_44_country_coverage_for_bis():
     provider, code, _ = get_best_provider("household_debt", countries=["DE"])
     assert provider == "BIS"
     assert code == "WS_TC"
+
+
+def test_get_best_provider_prefers_eurostat_for_hicp_inflation():
+    reload_catalog()
+    provider, code, _ = get_best_provider("hicp_inflation", countries=["DE"])
+    assert provider == "Eurostat"
+    assert code == "prc_hicp_aind"
+
+
+def test_get_best_provider_prefers_imf_for_real_effective_exchange_rate():
+    reload_catalog()
+    provider, code, _ = get_best_provider("real_effective_exchange_rate", countries=["JP"])
+    assert provider == "IMF"
+    assert code == "EREER"
+
+
+def test_real_effective_exchange_rate_worldbank_fallback_code_exists():
+    reload_catalog()
+    code = get_indicator_code("real_effective_exchange_rate", "WorldBank")
+    assert code == "PX.REX.REER"

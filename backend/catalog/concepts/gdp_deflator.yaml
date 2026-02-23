@@ -1,0 +1,55 @@
+# GDP Deflator Inflation Indicator Catalog
+concept: gdp_deflator
+category: prices
+domain: macroeconomics
+
+description: |
+  GDP deflator inflation measures broad economy-wide price changes and is often
+  used as an alternative inflation metric to CPI.
+
+synonyms:
+  primary:
+    - gdp deflator
+    - gdp deflator inflation
+    - inflation gdp deflator
+    - gross domestic product deflator
+  secondary:
+    - implicit price deflator
+    - gdp price deflator
+    - gdp deflator annual percent
+
+explicit_exclusions:
+  - cpi inflation
+  - consumer price inflation
+  - hicp
+  - producer price inflation
+
+providers:
+  WorldBank:
+    primary:
+      code: NY.GDP.DEFL.KD.ZG
+      name: "Inflation, GDP deflator (annual %)"
+      confidence: 0.95
+      coverage: global
+      frequency: annual
+
+  IMF:
+    primary:
+      code: NGDP_D
+      name: "National Accounts, Gross Domestic Product, Deflator"
+      confidence: 0.92
+      coverage: global
+      frequency: annual
+
+  FRED:
+    primary:
+      code: GDPDEF
+      name: "Gross Domestic Product: Implicit Price Deflator"
+      confidence: 0.90
+      coverage: [US]
+      frequency: quarterly
+
+not_available:
+  - Comtrade
+  - CoinGecko
+  - ExchangeRate

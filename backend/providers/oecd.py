@@ -541,11 +541,52 @@ class OECDProvider:
             candidates = []
             indicator_lower = catalog_lookup_term.lower()
             indicator_words = set(indicator_lower.replace("_", " ").split())
+            is_gdp_query = any(
+                token in indicator_lower
+                for token in (
+                    "gdp",
+                    "gross domestic product",
+                    "national accounts",
+                    "economic output",
+                )
+            )
+            is_labor_query = any(
+                token in indicator_lower
+                for token in (
+                    "unemployment",
+                    "employment",
+                    "labor",
+                    "labour",
+                    "participation",
+                    "hours worked",
+                )
+            )
+            is_price_query = any(
+                token in indicator_lower
+                for token in (
+                    "inflation",
+                    "price",
+                    "cpi",
+                    "ppi",
+                    "hicp",
+                    "deflator",
+                )
+            )
+            is_producer_price_query = any(
+                token in indicator_lower
+                for token in (
+                    "producer price",
+                    "ppi",
+                    "wholesale price",
+                )
+            )
 
             for flow_id, flow_info in catalog.items():
                 name = flow_info.get("name", "").lower()
                 desc = flow_info.get("description", "").lower()
                 structure = flow_info.get("structure", "")
+                flow_id_lower = str(flow_id).lower()
+                combined_text = f"{flow_id_lower} {name} {desc}"
 
                 # Calculate match score
                 score = 0
@@ -747,12 +788,18 @@ class OECDProvider:
                             priority_bonus += 5500
                             logger.debug(f"R&D expenditure boost for {flow_id}: +5500")
 
-                # Main statistical aggregates (GDP) - only boost if NOT asking for tax/revenue or working hours
-                if "NAMAIN" in structure and "tax" not in indicator_lower and "revenue" not in indicator_lower and not is_working_hours_query:
+                # Main statistical aggregates (GDP) - only boost for GDP-like intent.
+                if (
+                    "NAMAIN" in structure
+                    and is_gdp_query
+                    and "tax" not in indicator_lower
+                    and "revenue" not in indicator_lower
+                    and not is_working_hours_query
+                ):
                     priority_bonus += 1000  # National Accounts Main Aggregates
-                elif "QNA" in flow_id or "QNA" in name:
+                elif is_gdp_query and ("QNA" in flow_id or "QNA" in name):
                     priority_bonus += 800  # Quarterly National Accounts
-                elif "LFS" in structure or "IALFS" in flow_id:
+                elif is_labor_query and ("LFS" in structure or "IALFS" in flow_id):
                     priority_bonus += 800  # Labour Force Survey (for unemployment)
                     # Extra boost for "rates" dataflows when user asks for "rate"
                     # Check for "rate" word or "_rt" abbreviation (e.g., UNE_RT = unemployment rate)
@@ -762,7 +809,7 @@ class OECDProvider:
                         logger.debug(f"Rate match boost for {flow_id}: +500")
 
                 # High priority: Standard OECD datasets
-                elif "OECD" in flow_id and "PRICES" in name:
+                elif is_price_query and "OECD" in flow_id and "PRICES" in name:
                     priority_bonus += 600  # Main price indexes
 
                 # Negative priority: Specialized/derivative datasets
@@ -780,6 +827,19 @@ class OECDProvider:
                 if "tax" in indicator_lower or "revenue" in indicator_lower:
                     if "tax" in name.lower() or "revenue" in name.lower():
                         priority_bonus += 500  # Boost tax/revenue dataflows when user requests them
+
+                if is_producer_price_query:
+                    has_producer_signal = any(
+                        token in combined_text
+                        for token in ("producer", "ppi", "wholesale")
+                    )
+                    if has_producer_signal:
+                        priority_bonus += 900
+                    else:
+                        # Prevent generic national-accounts drift for producer-price intent.
+                        priority_bonus -= 1400
+                        if "NAMAIN" in structure:
+                            priority_bonus -= 600
 
                 if score > 0:
                     candidates.append((score + priority_bonus, flow_id, flow_info, structure))
@@ -838,8 +898,19 @@ class OECDProvider:
         upper = raw.upper()
         code_like = bool(re.fullmatch(r"[A-Z][A-Z0-9_.-]{2,24}", upper))
         is_dataflow_code = "@" in upper or upper.startswith("DSD_") or upper.startswith("DF_")
+        is_short_code_alias = False
 
+        semantic_terms: List[str] = []
+        short_code_aliases = {
+            "PPI": "producer price index",
+            "IRLT": "long-term interest rates",
+            "REER": "real effective exchange rate",
+            "CPI": "consumer price index",
+            "HICP": "harmonised index of consumer prices",
+            "B6BLTT": "current account balance",
+        }
         if code_like and not is_dataflow_code and " " not in raw:
+            is_short_code_alias = upper in short_code_aliases
             try:
                 from ..services.catalog_service import (
                     find_concepts_by_code,
@@ -854,15 +925,29 @@ class OECDProvider:
                     if isinstance(primary, dict):
                         primary_name = str(primary.get("name") or "").strip()
                         if primary_name:
-                            terms.append(primary_name)
+                            semantic_terms.append(primary_name)
 
                     # Add a few synonyms as backup search terms.
                     for synonym in get_all_synonyms(concept)[:3]:
                         synonym_text = str(synonym or "").strip()
                         if synonym_text:
-                            terms.append(synonym_text)
+                            semantic_terms.append(synonym_text)
             except Exception as exc:
                 logger.debug("OECD indicator alias expansion skipped for '%s': %s", indicator, exc)
+
+            # Generic short-code aliases to reduce ambiguous metadata matches.
+            alias = short_code_aliases.get(upper)
+            if alias:
+                semantic_terms.append(alias)
+
+        if semantic_terms:
+            if is_short_code_alias:
+                # Short aliases (PPI/CPI/REER/...) are often globally ambiguous.
+                # Prefer semantic expansions first, while still keeping raw code as
+                # a backup lookup term.
+                terms = semantic_terms + terms
+            else:
+                terms = semantic_terms + terms
 
         deduped: List[str] = []
         seen: set[str] = set()
@@ -1537,6 +1622,7 @@ class OECDProvider:
         # This prevents hitting rate limits from fetching 38+ individual countries
 
         # Step 1: Determine the target countries
+        requested_aggregate = False
         if not countries:
             # No countries specified - will try aggregate then major economies
             target_countries = None
@@ -1547,6 +1633,7 @@ class OECDProvider:
                 # Check if it's a special marker for OECD-wide data
                 if country_upper in ("OECD", "ALL_OECD", "ALL_OECD_COUNTRIES", "OECD_COUNTRIES", "OECD_AVERAGE", "OECD AVERAGE"):
                     target_countries = None  # Will use aggregate
+                    requested_aggregate = True
                 else:
                     # Single country/region - expand it
                     target_countries = self.expand_countries(countries[0])
@@ -1560,12 +1647,12 @@ class OECDProvider:
                             expanded_codes.append(code)
                 target_countries = expanded_codes
 
-        # Step 2: ALWAYS try OECD aggregate first (unless single specific country requested)
-        # This is the most efficient approach and avoids rate limiting
+        # Step 2: Try OECD aggregate only when no explicit country list was provided
+        # or when user explicitly requested OECD aggregate. For explicit country
+        # comparisons, fetch individual countries directly.
         should_try_aggregate = (
-            target_countries is None or  # No countries specified
-            len(target_countries) > 1 or  # Multiple countries (likely want comparison)
-            "ALL" in str(target_countries).upper()  # Requesting all countries
+            requested_aggregate
+            or (target_countries is None and not countries)
         )
 
         if should_try_aggregate:

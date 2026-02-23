@@ -163,6 +163,8 @@ class ParameterMapper:
                 "trade": ["NE.TRD.GNFS.ZS"],
                 "exports": ["NE.EXP.GNFS.ZS"],
                 "imports": ["NE.IMP.GNFS.ZS"],
+                "real effective exchange rate": ["PX.REX.REER"],
+                "reer": ["PX.REX.REER"],
                 "fdi": ["BX.KLT.DINV.WD.GD.ZS"],
                 "foreign direct investment": ["BX.KLT.DINV.WD.GD.ZS"],
             },
@@ -209,6 +211,8 @@ class ParameterMapper:
                 "current account": ["BCA_NGDPD"],
                 "population": ["LP"],
                 "exchange rate": ["EREER"],
+                "real effective exchange rate": ["EREER"],
+                "reer": ["EREER"],
             },
 
             "BIS": {
@@ -231,7 +235,7 @@ class ParameterMapper:
                 "housing prices": ["WS_SPP"],
                 "real estate prices": ["WS_SPP"],
                 "exchange rate": ["WS_XRU"],
-                "effective exchange rate": ["WS_XRU"],
+                "us dollar exchange rate": ["WS_XRU"],
                 "inflation": ["WS_LONG_CPI"],
                 "cpi": ["WS_LONG_CPI"],
                 "consumer prices": ["WS_LONG_CPI"],

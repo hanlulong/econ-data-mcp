@@ -40,7 +40,7 @@ providers:
     primary:
       code: rltir
       name: "Real long term government bond yield, percent"
-      confidence: 0.85
+      confidence: 0.90
       coverage: global
       frequency: annual
 
@@ -48,7 +48,7 @@ providers:
     primary:
       code: IRLT
       name: "Long-term interest rates"
-      confidence: 0.82
+      confidence: 0.70
       coverage: oecd_members
       frequency: monthly
 

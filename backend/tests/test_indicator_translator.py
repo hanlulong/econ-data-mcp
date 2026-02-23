@@ -133,3 +133,39 @@ def test_translate_debt_service_ratio_to_bis():
 
     assert concept == "debt_service_ratio"
     assert code == "WS_DSR"
+
+
+def test_translate_long_context_ppi_query_to_oecd():
+    translator = IndicatorTranslator()
+
+    code, concept = translator.translate_indicator(
+        "producer price inflation trend in the us and germany",
+        target_provider="OECD",
+    )
+
+    assert concept == "producer_price_inflation"
+    assert code == "PPI"
+
+
+def test_translate_trade_openness_query_to_worldbank():
+    translator = IndicatorTranslator()
+
+    code, concept = translator.translate_indicator(
+        "trade openness ratio (exports plus imports to gdp) in small open economies",
+        target_provider="WorldBank",
+    )
+
+    assert concept == "trade_openness"
+    assert code == "NE.TRD.GNFS.ZS"
+
+
+def test_translate_reer_query_to_worldbank_series_code():
+    translator = IndicatorTranslator()
+
+    code, concept = translator.translate_indicator(
+        "reer trend for china and india from 2012 to 2024",
+        target_provider="WorldBank",
+    )
+
+    assert concept == "real_effective_exchange_rate"
+    assert code == "PX.REX.REER"

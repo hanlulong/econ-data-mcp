@@ -110,6 +110,9 @@ class IndicatorResolver:
             )
         except ValueError:
             self._cache_ttl_seconds = 1800
+        self._cache_version = str(
+            os.getenv("INDICATOR_RESOLVER_CACHE_VERSION", "2026-02-23.1")
+        ).strip() or "2026-02-23.1"
         self._stop_words: Set[str] = {
             "the", "a", "an", "of", "for", "in", "to", "and", "or",
             "show", "get", "find", "data", "series", "indicator", "rate",
@@ -317,6 +320,7 @@ class IndicatorResolver:
                     search_results,
                     concept_name=query_concept,
                     preferred_codes=preferred_catalog_codes if preferred_catalog_codes else None,
+                    countries=context_countries,
                 )
                 best_code = self._normalize_code(best.get("code")) if best else ""
                 best_is_catalog_code = bool(best_code and best_code in preferred_catalog_codes)
@@ -710,7 +714,7 @@ class IndicatorResolver:
         )
         country_key = ",".join(country_tokens) if country_tokens else "-"
         query_key = str(query or "").strip().lower()
-        return f"{provider_key}:{country_key}:{query_key}"
+        return f"{self._cache_version}:{provider_key}:{country_key}:{query_key}"
 
     def _get_cached_result(self, cache_key: str) -> Optional[ResolvedIndicator]:
         """Return cached resolution result if present and not expired."""
@@ -772,6 +776,55 @@ class IndicatorResolver:
         normalized = re.sub(r"[_/]+", " ", str(query or "").strip().lower()).replace("-", " ")
         normalized = re.sub(r"\s+", " ", normalized).strip()
         return normalized
+
+    def _country_specific_code_penalty(
+        self,
+        code: Optional[str],
+        countries: Optional[List[str]],
+    ) -> float:
+        """
+        Penalize country-prefixed series codes when they mismatch query country scope.
+
+        Many provider namespaces (notably IMF) include series prefixed by one country
+        code (for example `VNM_...`). These are often wrong for multi-country/global
+        requests and should not outrank generic series.
+        """
+        normalized_code = self._normalize_code(code)
+        if not normalized_code:
+            return 0.0
+
+        match = re.match(r"^([A-Z]{3})_", normalized_code)
+        if not match:
+            return 0.0
+
+        code_iso3 = match.group(1)
+        if not CountryResolver.to_iso2(code_iso3):
+            return 0.0
+
+        if not countries:
+            return 0.30
+
+        requested_iso3: Set[str] = set()
+        for country in countries:
+            country_text = str(country or "").strip()
+            if not country_text:
+                continue
+
+            iso2 = CountryResolver.normalize(country_text)
+            if not iso2 and re.fullmatch(r"[A-Z]{3}", country_text.upper()):
+                iso2 = CountryResolver.to_iso2(country_text.upper())
+            if not iso2:
+                continue
+
+            iso3 = CountryResolver.to_iso3(iso2)
+            if iso3:
+                requested_iso3.add(iso3)
+
+        if not requested_iso3:
+            return 0.0
+        if code_iso3 in requested_iso3:
+            return 0.0 if len(requested_iso3) == 1 else 0.35
+        return 0.70
 
     def _score_search_match(self, query: str, candidate: Dict[str, Any], rank_index: int = 0) -> float:
         """
@@ -961,10 +1014,142 @@ class IndicatorResolver:
             ("producer" in query_terms and "price" in query_terms)
             or "ppi" in query_terms
         )
-        if producer_price_query and not (
-            "producer" in candidate_terms or "ppi" in candidate_terms or "wholesale" in candidate_terms
-        ):
-            confidence -= 0.28
+        if producer_price_query:
+            has_producer_signal = (
+                "producer" in candidate_terms
+                or "ppi" in candidate_terms
+                or "wholesale" in candidate_terms
+                or "pppi" in candidate_text_lower
+                or "pwpi" in candidate_text_lower
+            )
+            if has_producer_signal:
+                confidence += 0.26
+            else:
+                confidence -= 0.62
+                if any(
+                    token in candidate_text_lower
+                    for token in ("consumer price", "cpi", "hicp", "pcpipch")
+                ):
+                    confidence -= 0.18
+
+        # GDP deflator requests should not degrade to CPI/HICP/PPI.
+        gdp_deflator_query = bool(
+            re.search(r"\bgdp\b.{0,20}\bdeflator\b", query_text)
+            or re.search(r"\bdeflator\b.{0,20}\bgdp\b", query_text)
+        )
+        if gdp_deflator_query:
+            has_deflator_signal = any(
+                token in candidate_text_lower
+                for token in (
+                    "deflator",
+                    "gdpdef",
+                    "ngdp_d",
+                    "ny.gdp.defl",
+                )
+            )
+            if has_deflator_signal:
+                confidence += 0.30
+            else:
+                confidence -= 0.48
+                if any(
+                    token in candidate_text_lower
+                    for token in ("cpi", "consumer price", "hicp", "ppi")
+                ):
+                    confidence -= 0.16
+
+        # HICP requests should prioritize HICP-specific datasets.
+        hicp_query = any(
+            phrase in query_text
+            for phrase in (
+                "hicp",
+                "harmonized index",
+                "harmonised index",
+                "harmonized inflation",
+                "harmonised inflation",
+            )
+        )
+        if hicp_query:
+            has_hicp_signal = any(
+                token in candidate_text_lower
+                for token in (
+                    "hicp",
+                    "prc_hicp",
+                    "df_prices_hicp",
+                    "harmonized index",
+                    "harmonised index",
+                )
+            )
+            if has_hicp_signal:
+                confidence += 0.28
+            else:
+                confidence -= 0.46
+
+        ratio_patterns = (
+            "% of gdp",
+            "as % of gdp",
+            "as percent of gdp",
+            "as percentage of gdp",
+            "share of gdp",
+            "to gdp ratio",
+            "ratio to gdp",
+            "as share of gdp",
+        )
+        has_ratio_query = any(pattern in query_text for pattern in ratio_patterns)
+        directional_ratio_query = has_ratio_query and bool(
+            {"import", "imports", "export", "exports"} & query_terms
+        )
+        if directional_ratio_query:
+            has_ratio_signal = any(
+                token in candidate_text_lower
+                for token in (
+                    "% of gdp",
+                    "percent of gdp",
+                    "share of gdp",
+                    "as share of gdp",
+                    ".zs",
+                    "_ngdp",
+                )
+            )
+            if has_ratio_signal:
+                confidence += 0.22
+            else:
+                confidence -= 0.44
+                if any(
+                    token in candidate_text_lower
+                    for token in ("current us$", "constant us$", "million", "billion", "total trade")
+                ):
+                    confidence -= 0.24
+
+        # Trade-openness requests should prefer "exports + imports as % of GDP".
+        trade_openness_query = (
+            "trade openness" in query_text
+            or (
+                ("import" in query_terms or "imports" in query_terms)
+                and ("export" in query_terms or "exports" in query_terms)
+                and ("gdp" in query_terms)
+            )
+        )
+        if trade_openness_query:
+            has_openness_signal = any(
+                token in candidate_text_lower
+                for token in (
+                    "trade (% of gdp)",
+                    "trade openness",
+                    "exports plus imports",
+                    "imports plus exports",
+                    "ne.trd.gnfs.zs",
+                    "bfa_bop_b_xs_gdp_pt",
+                )
+            )
+            if has_openness_signal:
+                confidence += 0.24
+            elif any(
+                token in candidate_text_lower
+                for token in ("import", "export", "trade balance")
+            ):
+                confidence -= 0.12
+            else:
+                confidence -= 0.30
 
         # Debt-to-GDP requests should not degrade into debt-service or debt-securities datasets.
         debt_gdp_query = any(
@@ -974,6 +1159,7 @@ class IndicatorResolver:
                 "debt-to-gdp",
                 "debt as % of gdp",
                 "debt as percentage of gdp",
+                "debt (% of gdp)",
                 "gdp to debt ratio",
                 "gdp/debt ratio",
             )
@@ -1121,6 +1307,7 @@ class IndicatorResolver:
         search_results: List[Dict[str, Any]],
         concept_name: Optional[str] = None,
         preferred_codes: Optional[Set[str]] = None,
+        countries: Optional[List[str]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], float]:
         """Select best search result using lexical + concept-aware scoring."""
         best_result: Optional[Dict[str, Any]] = None
@@ -1136,6 +1323,13 @@ class IndicatorResolver:
                     confidence += 0.25
                 else:
                     confidence -= 0.05
+
+            country_penalty = self._country_specific_code_penalty(
+                candidate.get("code"),
+                countries,
+            )
+            if country_penalty > 0.0:
+                confidence -= country_penalty
 
             confidence = max(0.0, min(1.0, confidence))
             if confidence > best_confidence:
