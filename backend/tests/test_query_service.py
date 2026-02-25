@@ -1232,6 +1232,20 @@ class QueryServiceTests(unittest.TestCase):
         self.assertIn("Debt service ratios", options[0])
         self.assertNotIn("WS_DSR] WS_DSR", options[0])
 
+    def test_indicator_resolution_threshold_is_strict_for_high_precision_cues(self) -> None:
+        threshold = self.service._indicator_resolution_threshold(  # pylint: disable=protected-access
+            "producer price inflation trend in the us and germany",
+            resolved_source="database",
+        )
+        self.assertGreaterEqual(threshold, 0.74)
+
+    def test_indicator_resolution_threshold_allows_lower_for_generic_queries(self) -> None:
+        threshold = self.service._indicator_resolution_threshold(  # pylint: disable=protected-access
+            "gdp growth",
+            resolved_source="database",
+        )
+        self.assertLessEqual(threshold, 0.68)
+
     def test_eurostat_fetch_prefers_resolved_indicator_param(self) -> None:
         intent = ParsedIntent(
             apiProvider="Eurostat",
@@ -1464,13 +1478,34 @@ class QueryServiceTests(unittest.TestCase):
         )
 
     def test_is_fallback_relevant_accepts_reer_when_code_signal_is_in_series_id(self) -> None:
+        china_series = sample_series()
+        china_series.metadata.country = "China"
+        china_series.metadata.indicator = "Real effective exchange rate index (2010 = 100)"
+        china_series.metadata.seriesId = "PX.REX.REER"
+        china_series.metadata.description = "Real effective exchange rate index (2010 = 100)"
+
+        india_series = sample_series()
+        india_series.metadata.country = "India"
+        india_series.metadata.indicator = "Real effective exchange rate index (2010 = 100)"
+        india_series.metadata.seriesId = "PX.REX.REER"
+        india_series.metadata.description = "Real effective exchange rate index (2010 = 100)"
+
+        self.assertTrue(
+            self.service._is_fallback_relevant(  # pylint: disable=protected-access
+                ["EREER"],
+                [china_series, india_series],
+                target_countries=["China", "India"],
+                original_query="REER trend for China and India from 2012 to 2024",
+            )
+        )
+
+    def test_is_fallback_relevant_rejects_incomplete_country_coverage_for_multi_country_query(self) -> None:
         series = sample_series()
         series.metadata.country = "China"
         series.metadata.indicator = "Real effective exchange rate index (2010 = 100)"
         series.metadata.seriesId = "PX.REX.REER"
-        series.metadata.description = "Real effective exchange rate index (2010 = 100)"
 
-        self.assertTrue(
+        self.assertFalse(
             self.service._is_fallback_relevant(  # pylint: disable=protected-access
                 ["EREER"],
                 [series],
@@ -1478,6 +1513,54 @@ class QueryServiceTests(unittest.TestCase):
                 original_query="REER trend for China and India from 2012 to 2024",
             )
         )
+
+    def test_assess_country_coverage_reports_missing_countries(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="WorldBank",
+            indicators=["imports as % of GDP"],
+            parameters={"countries": ["China", "US"]},
+            clarificationNeeded=False,
+            originalQuery="import share of gdp in china and us",
+        )
+        series = sample_series()
+        series.metadata.country = "China"
+        series.metadata.indicator = "Imports of goods and services (% of GDP)"
+
+        coverage = self.service._assess_country_coverage(  # pylint: disable=protected-access
+            intent,
+            [series],
+        )
+
+        self.assertIsNotNone(coverage)
+        assert coverage is not None
+        self.assertFalse(coverage["complete"])
+        self.assertIn("US", coverage["missing_iso2"])
+
+    def test_maybe_improve_country_coverage_returns_warning_when_incomplete(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="WorldBank",
+            indicators=["imports as % of GDP"],
+            parameters={"countries": ["China", "US"]},
+            clarificationNeeded=False,
+            originalQuery="import share of gdp in china and us",
+        )
+        series = sample_series()
+        series.metadata.country = "China"
+        series.metadata.indicator = "Imports of goods and services (% of GDP)"
+
+        with patch.object(self.service, "_try_with_fallback", side_effect=DataNotAvailableError("no fallback")):
+            improved_data, warning = run(
+                self.service._maybe_improve_country_coverage(  # pylint: disable=protected-access
+                    query=intent.originalQuery or "",
+                    intent=intent,
+                    data=[series],
+                )
+            )
+
+        self.assertEqual(len(improved_data), 1)
+        self.assertIsNotNone(warning)
+        assert warning is not None
+        self.assertIn("Missing", warning)
 
     def test_try_with_fallback_sanitizes_provider_specific_indicator_params(self) -> None:
         intent = ParsedIntent(
@@ -1725,6 +1808,41 @@ class QueryServiceTests(unittest.TestCase):
         self.assertIsNone(response.error)
         self.assertEqual(len(response.data or []), 1)
         self.assertTrue(fallback_mock.called)
+
+    def test_process_query_adds_warning_when_multi_country_coverage_is_partial(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="WORLDBANK",
+            indicators=["imports share of gdp"],
+            parameters={"countries": ["China", "US"]},
+            clarificationNeeded=False,
+            originalQuery="import share of gdp in china and us",
+        )
+
+        class _Settings:
+            use_langchain_orchestrator = False
+
+        china_series = sample_series()
+        china_series.metadata.source = "WorldBank"
+        china_series.metadata.country = "China"
+        china_series.metadata.indicator = "Imports of goods and services (% of GDP)"
+        china_series.metadata.seriesId = "NE.IMP.GNFS.ZS"
+
+        with patch("backend.config.get_settings", return_value=_Settings()), \
+             patch.object(self.service.openrouter, "parse_query", return_value=intent), \
+             patch("backend.services.query.QueryComplexityAnalyzer.detect_complexity", return_value={"pro_mode_required": False, "complexity_factors": []}), \
+             patch("backend.services.query.ParameterValidator.validate_intent", return_value=(True, None, None)), \
+             patch("backend.services.query.ParameterValidator.check_confidence", return_value=(True, None)), \
+             patch.object(self.service, "_fetch_data", return_value=[china_series]), \
+             patch.object(self.service, "_try_with_fallback", side_effect=DataNotAvailableError("no fallback")), \
+             patch.object(self.service, "_build_uncertain_result_clarification", return_value=None):
+            response = run(self.service.process_query("import share of gdp in china and us", auto_pro_mode=False))
+
+        self.assertFalse(response.clarificationNeeded)
+        self.assertEqual(len(response.data or []), 1)
+        self.assertIsNotNone(response.message)
+        assert response.message is not None
+        self.assertIn("subset of requested countries", response.message)
+        self.assertIn("Missing", response.message)
 
     def test_process_query_returns_indicator_clarification_when_no_data_and_options_exist(self) -> None:
         intent = ParsedIntent(

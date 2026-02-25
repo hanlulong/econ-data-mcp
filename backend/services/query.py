@@ -2811,16 +2811,58 @@ class QueryService:
         score lower in lexical systems; use a slightly lower threshold there while
         keeping strict defaults for weakly-signaled queries.
         """
-        threshold = 0.70
+        threshold = 0.68
         normalized_query = str(indicator_query or "").strip().lower()
         cue_set = self._extract_indicator_cues(normalized_query)
+        ratio_patterns = (
+            "% of gdp",
+            "as % of gdp",
+            "as percent of gdp",
+            "as percentage of gdp",
+            "share of gdp",
+            "to gdp ratio",
+            "ratio to gdp",
+            "as share of gdp",
+        )
+        has_ratio_query = any(pattern in normalized_query for pattern in ratio_patterns)
+        strict_precision_cues = {
+            "import",
+            "export",
+            "trade_balance",
+            "trade_openness",
+            "debt_gdp_ratio",
+            "public_debt",
+            "gdp_deflator",
+            "hicp",
+            "producer_price",
+            "real_effective_exchange_rate",
+            "bond_yield",
+            "money_supply",
+            "policy_rate",
+            "house_prices",
+        }
+        high_precision_cues = {
+            "trade_openness",
+            "gdp_deflator",
+            "hicp",
+            "producer_price",
+            "real_effective_exchange_rate",
+        }
 
         if cue_set:
-            threshold = 0.60
+            threshold = 0.64
         if len(normalized_query.split()) >= 6:
             threshold = min(threshold, 0.62)
         if resolved_source in {"catalog", "translator"}:
-            threshold = min(threshold, 0.60)
+            threshold = min(threshold, 0.62)
+        if cue_set & strict_precision_cues:
+            threshold = max(threshold, 0.72)
+        if cue_set & high_precision_cues:
+            threshold = max(threshold, 0.76)
+        if has_ratio_query and (cue_set & {"import", "export"}):
+            threshold = max(threshold, 0.78)
+        if resolved_source in {"catalog", "translator"} and (cue_set & high_precision_cues):
+            threshold = min(threshold, 0.74)
 
         return threshold
 
@@ -3613,6 +3655,154 @@ class QueryService:
 
         return None
 
+    def _assess_country_coverage(
+        self,
+        intent: Optional[ParsedIntent],
+        data: Optional[List[NormalizedData]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Assess whether a multi-country request is fully represented in result data.
+
+        Returns None when coverage checks do not apply (for example single-country
+        queries), otherwise returns a dict with coverage details.
+        """
+        if not intent or not data:
+            return None
+
+        requested_countries = self._collect_target_countries(intent.parameters)
+        if len(requested_countries) < 2:
+            return None
+
+        requested_map: "OrderedDict[str, str]" = OrderedDict()
+        for raw_country in requested_countries:
+            normalized_iso2 = self._normalize_country_to_iso2(raw_country)
+            if not normalized_iso2:
+                continue
+            requested_map.setdefault(normalized_iso2, str(raw_country))
+
+        if len(requested_map) < 2:
+            return None
+
+        returned_map: "OrderedDict[str, str]" = OrderedDict()
+        for series in data:
+            metadata = getattr(series, "metadata", None) if series is not None else None
+            if not metadata:
+                continue
+            result_country = getattr(metadata, "country", None)
+            normalized_iso2 = self._normalize_country_to_iso2(result_country)
+            if not normalized_iso2:
+                continue
+            returned_map.setdefault(normalized_iso2, str(result_country))
+
+        missing_iso2 = [iso2 for iso2 in requested_map.keys() if iso2 not in returned_map]
+        covered_iso2 = [iso2 for iso2 in requested_map.keys() if iso2 in returned_map]
+        coverage_ratio = len(covered_iso2) / max(len(requested_map), 1)
+
+        return {
+            "requested_iso2": list(requested_map.keys()),
+            "requested_display": list(requested_map.values()),
+            "returned_iso2": list(returned_map.keys()),
+            "returned_display": list(returned_map.values()),
+            "missing_iso2": missing_iso2,
+            "missing_display": [requested_map[iso2] for iso2 in missing_iso2],
+            "covered_count": len(covered_iso2),
+            "requested_count": len(requested_map),
+            "coverage_ratio": coverage_ratio,
+            "complete": len(missing_iso2) == 0,
+        }
+
+    def _build_country_coverage_warning_message(
+        self,
+        coverage: Dict[str, Any],
+    ) -> str:
+        """Create a concise user-facing warning for partial multi-country coverage."""
+        missing_display = [str(item) for item in (coverage.get("missing_display") or []) if item]
+        returned_display = [str(item) for item in (coverage.get("returned_display") or []) if item]
+
+        if missing_display:
+            missing_text = ", ".join(missing_display)
+            if returned_display:
+                available_text = ", ".join(returned_display)
+                return (
+                    "Data is only available for a subset of requested countries. "
+                    f"Missing: {missing_text}. Available: {available_text}."
+                )
+            return (
+                "Data is only available for a subset of requested countries. "
+                f"Missing: {missing_text}."
+            )
+
+        return ""
+
+    async def _maybe_improve_country_coverage(
+        self,
+        query: str,
+        intent: Optional[ParsedIntent],
+        data: Optional[List[NormalizedData]],
+    ) -> tuple[List[NormalizedData], Optional[str]]:
+        """
+        Try to improve multi-country coverage via fallback providers, then return
+        data plus optional warning when coverage remains partial.
+        """
+        current_data = list(data or [])
+        if not intent or not current_data:
+            return current_data, None
+
+        initial_coverage = self._assess_country_coverage(intent, current_data)
+        if not initial_coverage or initial_coverage.get("complete"):
+            return current_data, None
+
+        logger.warning(
+            "Partial country coverage detected for query '%s': covered=%s/%s missing=%s",
+            query,
+            initial_coverage.get("covered_count"),
+            initial_coverage.get("requested_count"),
+            initial_coverage.get("missing_display"),
+        )
+
+        best_data = current_data
+        best_coverage = initial_coverage
+
+        try:
+            fallback_data = await self._try_with_fallback(
+                intent,
+                DataNotAvailableError("Partial multi-country coverage from primary provider"),
+            )
+        except Exception as exc:
+            logger.info("Coverage fallback attempt failed: %s", exc)
+            fallback_data = None
+
+        if fallback_data:
+            fallback_data = self._rerank_data_by_query_relevance(query, fallback_data)
+            fallback_data = self._apply_ranking_projection(query, fallback_data)
+            fallback_coverage = self._assess_country_coverage(intent, fallback_data)
+            if fallback_coverage:
+                fallback_score = (
+                    float(fallback_coverage.get("coverage_ratio", 0.0)),
+                    int(fallback_coverage.get("covered_count", 0)),
+                )
+                best_score = (
+                    float(best_coverage.get("coverage_ratio", 0.0)),
+                    int(best_coverage.get("covered_count", 0)),
+                )
+                if fallback_score > best_score:
+                    best_data = fallback_data
+                    best_coverage = fallback_coverage
+                    logger.info(
+                        "Coverage fallback improved country coverage to %s/%s",
+                        best_coverage.get("covered_count"),
+                        best_coverage.get("requested_count"),
+                    )
+            elif fallback_data:
+                # If fallback cannot be evaluated but has payload, keep original best.
+                logger.debug("Coverage fallback returned data without country labels; keeping primary result")
+
+        if best_coverage.get("complete"):
+            return best_data, None
+
+        warning_message = self._build_country_coverage_warning_message(best_coverage)
+        return best_data, warning_message or None
+
     def _get_fallback_providers(
         self,
         primary_provider: str,
@@ -3895,6 +4085,7 @@ class QueryService:
         if requested_iso2:
             saw_normalized_country = False
             matched_requested_country = False
+            returned_iso2: set[str] = set()
             for data in fallback_result:
                 if not data.metadata or not data.metadata.country:
                     continue
@@ -3905,6 +4096,7 @@ class QueryService:
                     continue
 
                 saw_normalized_country = True
+                returned_iso2.add(result_iso2)
                 if result_iso2 in requested_iso2:
                     matched_requested_country = True
                     continue
@@ -3922,6 +4114,17 @@ class QueryService:
                     sorted(requested_iso2),
                 )
                 return False
+
+            if len(requested_iso2) >= 2 and saw_normalized_country:
+                missing_iso2 = requested_iso2 - returned_iso2
+                if missing_iso2:
+                    logger.warning(
+                        "Fallback rejected: incomplete country coverage requested=%s returned=%s missing=%s",
+                        sorted(requested_iso2),
+                        sorted(returned_iso2),
+                        sorted(missing_iso2),
+                    )
+                    return False
 
         # Define subject entities (who/what the data is about)
         subject_entities = {
@@ -4454,11 +4657,17 @@ class QueryService:
                         logger.info("✅ Fallback succeeded after empty primary response")
                         fallback_data = self._rerank_data_by_query_relevance(query, fallback_data)
                         fallback_data = self._apply_ranking_projection(query, fallback_data)
+                        fallback_data, coverage_warning = await self._maybe_improve_country_coverage(
+                            query,
+                            intent,
+                            fallback_data,
+                        )
                         return QueryResponse(
                             conversationId=conv_id,
                             intent=intent,
                             data=fallback_data,
                             clarificationNeeded=False,
+                            message=coverage_warning,
                             processingSteps=tracker.to_list(),
                         )
                 except Exception as fallback_exc:
@@ -4468,11 +4677,17 @@ class QueryService:
                 recovered_data = await self._maybe_recover_from_empty_data(query, intent)
                 if recovered_data:
                     logger.info("✅ Semantic recovery succeeded after empty primary response")
+                    recovered_data, coverage_warning = await self._maybe_improve_country_coverage(
+                        query,
+                        intent,
+                        recovered_data,
+                    )
                     return QueryResponse(
                         conversationId=conv_id,
                         intent=intent,
                         data=recovered_data,
                         clarificationNeeded=False,
+                        message=coverage_warning,
                         processingSteps=tracker.to_list(),
                     )
 
@@ -4518,6 +4733,11 @@ class QueryService:
             )
             if recovered_uncertain_data:
                 data = recovered_uncertain_data
+            data, coverage_warning = await self._maybe_improve_country_coverage(
+                query,
+                intent,
+                data,
+            )
             clarification_response = self._build_uncertain_result_clarification(
                 conversation_id=conv_id,
                 query=query,
@@ -4539,6 +4759,7 @@ class QueryService:
                 intent=intent,
                 data=data,
                 clarificationNeeded=False,
+                message=coverage_warning,
                 processingSteps=tracker.to_list(),
             )
         except DataNotAvailableError as exc:
@@ -4553,11 +4774,17 @@ class QueryService:
                         logger.info("✅ Fallback succeeded!")
                         fallback_data = self._rerank_data_by_query_relevance(query, fallback_data)
                         fallback_data = self._apply_ranking_projection(query, fallback_data)
+                        fallback_data, coverage_warning = await self._maybe_improve_country_coverage(
+                            query,
+                            intent,
+                            fallback_data,
+                        )
                         return QueryResponse(
                             conversationId=conv_id,
                             intent=intent,
                             data=fallback_data,
                             clarificationNeeded=False,
+                            message=coverage_warning,
                             processingSteps=tracker.to_list(),
                         )
                 except Exception as fallback_exc:
@@ -4595,11 +4822,17 @@ class QueryService:
                         logger.info("✅ Fallback succeeded after error!")
                         fallback_data = self._rerank_data_by_query_relevance(query, fallback_data)
                         fallback_data = self._apply_ranking_projection(query, fallback_data)
+                        fallback_data, coverage_warning = await self._maybe_improve_country_coverage(
+                            query,
+                            intent,
+                            fallback_data,
+                        )
                         return QueryResponse(
                             conversationId=conv_id,
                             intent=intent,
                             data=fallback_data,
                             clarificationNeeded=False,
+                            message=coverage_warning,
                             processingSteps=tracker.to_list(),
                         )
                 except Exception as fallback_exc:
@@ -6009,11 +6242,17 @@ class QueryService:
                     )
                     recovered_data = await self._maybe_recover_from_empty_data(query, recovery_intent)
                     if recovered_data:
+                        recovered_data, coverage_warning = await self._maybe_improve_country_coverage(
+                            query,
+                            recovery_intent,
+                            recovered_data,
+                        )
                         return QueryResponse(
                             conversationId=conversation_id,
                             intent=recovery_intent,
                             data=recovered_data,
                             clarificationNeeded=False,
+                            message=coverage_warning,
                             processingSteps=tracker.to_list() if tracker else None,
                         )
 
@@ -6101,6 +6340,18 @@ class QueryService:
                         if recovered_uncertain_data:
                             data = recovered_uncertain_data
                             response.data = data
+                    if response.intent:
+                        data, coverage_warning = await self._maybe_improve_country_coverage(
+                            query,
+                            response.intent,
+                            data,
+                        )
+                        response.data = data
+                        if coverage_warning:
+                            if response.message:
+                                response.message = f"{response.message}\n\n{coverage_warning}"
+                            else:
+                                response.message = coverage_warning
                     clarification_response = self._build_uncertain_result_clarification(
                         conversation_id=conversation_id,
                         query=query,
@@ -7005,6 +7256,11 @@ class QueryService:
         )
         if recovered_uncertain_data:
             data = recovered_uncertain_data
+        data, coverage_warning = await self._maybe_improve_country_coverage(
+            query,
+            intent,
+            data,
+        )
         clarification_response = self._build_uncertain_result_clarification(
             conversation_id=conversation_id,
             query=query,
@@ -7026,6 +7282,7 @@ class QueryService:
             intent=intent,
             data=data,
             clarificationNeeded=False,
+            message=coverage_warning,
             processingSteps=tracker.to_list() if tracker else None,
         )
 
