@@ -777,6 +777,33 @@ class IndicatorResolver:
         normalized = re.sub(r"\s+", " ", normalized).strip()
         return normalized
 
+    @staticmethod
+    def _single_directional_term(terms: Set[str]) -> str:
+        """Return a strict single trade direction from query terms, if present."""
+        has_import = bool({"import", "imports"} & terms)
+        has_export = bool({"export", "exports"} & terms)
+        if has_import and not has_export:
+            return "import"
+        if has_export and not has_import:
+            return "export"
+        return ""
+
+    @staticmethod
+    def _candidate_has_directional_signal(candidate_text_lower: str, direction: str) -> bool:
+        """Detect import/export directional signal in names/descriptions/codes."""
+        direction_norm = str(direction or "").strip().lower()
+        if direction_norm == "import":
+            return any(
+                token in candidate_text_lower
+                for token in ("import", "imports", ".imp.", "_imp", "imp_")
+            )
+        if direction_norm == "export":
+            return any(
+                token in candidate_text_lower
+                for token in ("export", "exports", ".exp.", "_exp", "exp_")
+            )
+        return False
+
     def _country_specific_code_penalty(
         self,
         code: Optional[str],
@@ -948,6 +975,21 @@ class IndicatorResolver:
                 confidence -= 0.28
                 if candidate_directionals and not (candidate_directionals & directional_core):
                     confidence -= 0.10
+        query_direction = self._single_directional_term(query_terms)
+        if query_direction:
+            opposite_direction = "export" if query_direction == "import" else "import"
+            has_query_direction_signal = self._candidate_has_directional_signal(
+                candidate_text_lower,
+                query_direction,
+            )
+            has_opposite_direction_signal = self._candidate_has_directional_signal(
+                candidate_text_lower,
+                opposite_direction,
+            )
+            if has_opposite_direction_signal and not has_query_direction_signal:
+                confidence -= 0.38
+            elif not has_query_direction_signal:
+                confidence -= 0.14
         # Mild penalty when core terms only appear in long descriptions.
         if core_query_terms and effective_core_overlap_count > 0 and effective_core_name_overlap_count == 0:
             confidence -= 0.06
@@ -1110,8 +1152,13 @@ class IndicatorResolver:
                     "_ngdp",
                 )
             )
+            has_directional_signal = (
+                self._candidate_has_directional_signal(candidate_text_lower, query_direction)
+                if query_direction else True
+            )
+            has_directional_ratio_signal = has_ratio_signal and has_directional_signal
             if has_ratio_signal:
-                confidence += 0.22
+                confidence += 0.22 if has_directional_ratio_signal else -0.16
             else:
                 confidence -= 0.44
                 if any(
@@ -1119,6 +1166,8 @@ class IndicatorResolver:
                     for token in ("current us$", "constant us$", "million", "billion", "total trade")
                 ):
                     confidence -= 0.24
+            if has_ratio_signal and query_direction and not has_directional_ratio_signal:
+                confidence -= 0.24
 
         # Trade-openness requests should prefer "exports + imports as % of GDP".
         trade_openness_query = (

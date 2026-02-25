@@ -709,6 +709,35 @@ class IndicatorResolverTests(unittest.TestCase):
         self.assertEqual(result.code, "NE.IMP.GNFS.ZS")
         self.assertGreaterEqual(result.confidence, 0.7)
 
+    def test_score_search_match_penalizes_opposite_direction_ratio_candidates(self):
+        resolver = IndicatorResolver(lookup=_FakeLookup(), translator=_FakeTranslator())
+        query = "import share of gdp"
+        import_candidate = {
+            "code": "NE.IMP.GNFS.ZS",
+            "provider": "WorldBank",
+            "name": "Imports of goods and services (% of GDP)",
+            "description": "",
+        }
+        export_candidate = {
+            "code": "NE.EXP.GNFS.ZS",
+            "provider": "WorldBank",
+            "name": "Exports of goods and services (% of GDP)",
+            "description": "",
+        }
+        generic_ratio_candidate = {
+            "code": "NY.GNS.ICTR.ZS",
+            "provider": "WorldBank",
+            "name": "Gross domestic savings (% of GDP)",
+            "description": "",
+        }
+
+        import_score = resolver._score_search_match(query, import_candidate)  # pylint: disable=protected-access
+        export_score = resolver._score_search_match(query, export_candidate)  # pylint: disable=protected-access
+        generic_score = resolver._score_search_match(query, generic_ratio_candidate)  # pylint: disable=protected-access
+
+        self.assertGreater(import_score, export_score + 0.2)
+        self.assertGreater(import_score, generic_score + 0.2)
+
     def test_rrf_fusion_can_promote_vector_only_candidate(self):
         lookup = _FakeLookup(
             search_results=[

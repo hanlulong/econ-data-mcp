@@ -712,7 +712,36 @@ class QueryService:
         return cues
 
     @staticmethod
+    def _single_directional_cue(cues: set[str]) -> str:
+        """
+        Return the single directional cue requested by a query, if any.
+
+        Empty string means no strict single-direction intent (for example, trade openness).
+        """
+        has_import = "import" in cues
+        has_export = "export" in cues
+        if has_import and not has_export:
+            return "import"
+        if has_export and not has_import:
+            return "export"
+        return ""
+
+    @classmethod
+    def _has_directional_conflict(
+        cls,
+        query_cues: set[str],
+        candidate_cues: set[str],
+    ) -> bool:
+        """Detect import/export direction conflicts between query and candidate."""
+        query_direction = cls._single_directional_cue(query_cues)
+        if not query_direction:
+            return False
+        opposite = "export" if query_direction == "import" else "import"
+        return opposite in candidate_cues and query_direction not in candidate_cues
+
+    @classmethod
     def _specific_cues_compatible(
+        cls,
         query_cues: set[str],
         candidate_cues: set[str],
     ) -> bool:
@@ -724,6 +753,11 @@ class QueryService:
         """
         if not query_cues:
             return True
+        if cls._has_directional_conflict(query_cues, candidate_cues):
+            return False
+        query_direction = cls._single_directional_cue(query_cues)
+        if query_direction and "trade_balance" in candidate_cues and query_direction not in candidate_cues:
+            return False
         if query_cues & candidate_cues:
             return True
 
@@ -774,12 +808,15 @@ class QueryService:
         score = 0.0
         query_cues = self._extract_indicator_cues(query_text)
         series_cues = self._extract_indicator_cues(series_text)
+        query_direction = self._single_directional_cue(query_cues)
 
         if query_cues:
             cue_overlap = query_cues & series_cues
             score += float(len(cue_overlap)) * 2.5
             if not cue_overlap:
                 score -= 2.0
+        if self._has_directional_conflict(query_cues, series_cues):
+            score -= 3.4
 
         query_terms = self._tokenize_indicator_terms(query_text)
         series_terms = self._tokenize_indicator_terms(series_text)
@@ -806,10 +843,14 @@ class QueryService:
                 score -= 1.8
 
         # Penalize directional mismatches.
-        if "import" in query_cues and "import" not in series_cues and "trade_balance" not in series_cues:
+        if "import" in query_cues and "import" not in series_cues:
             score -= 2.2
-        if "export" in query_cues and "export" not in series_cues and "trade_balance" not in series_cues:
+            if "trade_balance" in series_cues:
+                score -= 1.0
+        if "export" in query_cues and "export" not in series_cues:
             score -= 2.2
+            if "trade_balance" in series_cues:
+                score -= 1.0
         if "trade_balance" in query_cues and "trade_balance" not in series_cues:
             score -= 2.2
         if "current_account" in query_cues and "current_account" not in series_cues:
@@ -881,11 +922,23 @@ class QueryService:
                 "ne.exp.gnfs.zs",
                 "_ngdp",
             )
-            has_directional_ratio_signal = any(signal in series_text for signal in ratio_signals)
+            has_ratio_signal = any(signal in series_text for signal in ratio_signals)
+            directional_tokens = ()
+            if query_direction == "import":
+                directional_tokens = ("import", "imports", ".imp.", "_imp", "imp_")
+            elif query_direction == "export":
+                directional_tokens = ("export", "exports", ".exp.", "_exp", "exp_")
+            has_directional_signal = (
+                any(token in series_text for token in directional_tokens)
+                if directional_tokens else True
+            )
+            has_directional_ratio_signal = has_ratio_signal and has_directional_signal
             if has_directional_ratio_signal:
                 score += 1.2
             else:
                 score -= 2.6
+                if has_ratio_signal and directional_tokens:
+                    score -= 1.4
                 if any(token in series_text for token in ("current us$", "constant us$", "million", "billion")):
                     score -= 1.2
 
@@ -1084,6 +1137,177 @@ class QueryService:
         elif source == "catalog":
             source_bonus = 0.06
         return confidence + (0.12 * relevance) + source_bonus
+
+    def _score_resolved_indicator_relevance(
+        self,
+        indicator_query: str,
+        provider: str,
+        resolved: Any,
+    ) -> float:
+        """Score semantic relevance between user indicator query and resolved candidate."""
+        if not resolved:
+            return -999.0
+
+        provider_norm = normalize_provider_name(provider or getattr(resolved, "provider", ""))
+        code_text = str(getattr(resolved, "code", "") or "")
+        code_hint = self._code_semantic_hint(provider_norm, code_text)
+        resolved_metadata = getattr(resolved, "metadata", None) or {}
+        metadata_indicator = str(resolved_metadata.get("indicator", "") or "")
+        metadata_description = str(resolved_metadata.get("description", "") or "")
+        synthetic_series = {
+            "metadata": {
+                "source": provider_norm,
+                "indicator": " ".join(
+                    part for part in [
+                        metadata_indicator,
+                        str(getattr(resolved, "name", "") or ""),
+                        metadata_description,
+                        code_hint,
+                        code_text,
+                    ] if part
+                ),
+                "seriesId": code_text,
+            }
+        }
+        return self._score_series_relevance(indicator_query, synthetic_series)
+
+    def _code_semantic_hint(self, provider: str, code: str) -> str:
+        """
+        Derive lightweight semantic hints from provider-native code patterns.
+
+        This improves relevance scoring when resolver candidates are code-heavy
+        and have limited human-readable metadata.
+        """
+        provider_norm = normalize_provider_name(provider)
+        code_upper = str(code or "").upper().strip()
+        if not code_upper:
+            return ""
+
+        hints: List[str] = []
+
+        if provider_norm in {"WORLDBANK", "WORLD BANK"}:
+            if ".IMP." in code_upper:
+                hints.extend(["imports", "import"])
+            if ".EXP." in code_upper:
+                hints.extend(["exports", "export"])
+            if ".TRD." in code_upper:
+                hints.extend(["trade openness", "trade"])
+            if ".RSB." in code_upper:
+                hints.extend(["trade balance", "external balance"])
+            if ".CAB." in code_upper:
+                hints.extend(["current account"])
+            if ".DOD." in code_upper:
+                hints.extend(["government debt", "public debt"])
+            if ".REX.REER" in code_upper:
+                hints.extend(["real effective exchange rate", "reer"])
+            if ".WPI." in code_upper:
+                hints.extend(["producer price", "ppi"])
+            if ".CPI." in code_upper:
+                hints.extend(["consumer price", "inflation", "cpi"])
+            if ".DEFL." in code_upper:
+                hints.extend(["gdp deflator"])
+            if code_upper.endswith(".ZS"):
+                hints.extend(["% of gdp", "share of gdp"])
+
+        if provider_norm == "FRED":
+            if code_upper.startswith("DGS"):
+                hints.extend(["government bond yield", "treasury yield"])
+                tenor = code_upper.replace("DGS", "")
+                if tenor.isdigit():
+                    hints.extend([f"{tenor}-year", f"{tenor} year"])
+            if code_upper.startswith("GS") and code_upper[2:].isdigit():
+                tenor = code_upper[2:]
+                hints.extend([f"{tenor}-year", f"{tenor} year", "government bond yield"])
+            if "PPI" in code_upper:
+                hints.extend(["producer price", "ppi"])
+            if "CPI" in code_upper:
+                hints.extend(["consumer price", "cpi", "inflation"])
+            if "FEDFUNDS" in code_upper or code_upper in {"DFF", "DFEDTARU", "DFEDTARL"}:
+                hints.extend(["policy rate", "federal funds"])
+            if code_upper.startswith("DEX"):
+                hints.extend(["exchange rate", "fx"])
+            if "M1" in code_upper:
+                hints.extend(["money supply", "m1"])
+            if "M2" in code_upper:
+                hints.extend(["money supply", "m2"])
+            if "M3" in code_upper:
+                hints.extend(["money supply", "m3"])
+
+        if provider_norm == "IMF":
+            if "BCA" in code_upper:
+                hints.extend(["current account"])
+            if "NGDP" in code_upper:
+                hints.extend(["gdp", "% of gdp"])
+            if "EREER" in code_upper or "REER" in code_upper:
+                hints.extend(["real effective exchange rate", "reer"])
+            if "PCPIPCH" in code_upper:
+                hints.extend(["consumer price", "inflation", "cpi"])
+            if "PPPI" in code_upper or "PWPI" in code_upper:
+                hints.extend(["producer price", "ppi"])
+
+        if provider_norm == "BIS":
+            if code_upper == "WS_DSR":
+                hints.extend(["debt service ratio"])
+            if code_upper == "WS_SPP":
+                hints.extend(["house prices"])
+            if code_upper == "WS_CBPOL":
+                hints.extend(["policy rate"])
+
+        return " ".join(dict.fromkeys(hints))
+
+    def _minimum_resolved_relevance_threshold(self, indicator_query: str) -> float:
+        """
+        Minimum semantic relevance required to accept a resolved indicator code.
+
+        Keeps high-precision intents strict (imports/exports ratios, REER, HICP, etc.)
+        while allowing broader queries to remain flexible.
+        """
+        normalized_query = str(indicator_query or "").strip().lower()
+        cue_set = self._extract_indicator_cues(normalized_query)
+        ratio_patterns = (
+            "% of gdp",
+            "as % of gdp",
+            "as percent of gdp",
+            "as percentage of gdp",
+            "share of gdp",
+            "to gdp ratio",
+            "ratio to gdp",
+            "as share of gdp",
+        )
+        has_ratio_query = any(pattern in normalized_query for pattern in ratio_patterns)
+
+        threshold = -0.40
+        strict_precision_cues = {
+            "import",
+            "export",
+            "trade_balance",
+            "trade_openness",
+            "debt_gdp_ratio",
+            "public_debt",
+            "gdp_deflator",
+            "hicp",
+            "producer_price",
+            "real_effective_exchange_rate",
+            "bond_yield",
+            "money_supply",
+            "policy_rate",
+            "house_prices",
+        }
+        high_precision_cues = {
+            "trade_openness",
+            "gdp_deflator",
+            "hicp",
+            "producer_price",
+            "real_effective_exchange_rate",
+        }
+
+        if cue_set & strict_precision_cues:
+            threshold = max(threshold, 0.10)
+        if cue_set & high_precision_cues:
+            threshold = max(threshold, 0.35)
+        if has_ratio_query and (cue_set & {"import", "export"}):
+            threshold = max(threshold, 0.45)
+        return threshold
 
     @staticmethod
     def _is_placeholder_indicator_code(code: Optional[str]) -> bool:
@@ -2227,6 +2451,9 @@ class QueryService:
                 pass
 
         options = self._dedupe_indicator_choice_options(options)
+        mismatch_hint = self._build_indicator_mismatch_hint(query, top_series)
+        directional_conflict = self._has_directional_conflict(high_signal_query_cues, top_series_cues)
+        severe_mismatch = bool(mismatch_hint) and (directional_conflict or top_score < 0.25)
         distinct_options: set[tuple[str, str]] = set()
         for option in options:
             parsed = self._parse_indicator_option(option)
@@ -2241,17 +2468,30 @@ class QueryService:
         if top_provider and top_code and not self._is_placeholder_indicator_code(top_code):
             distinct_options.add((top_provider, top_code))
 
-        if len(distinct_options) < 2:
-            return None
-
-        if len(options) < 2:
-            return None
+        if len(distinct_options) < 2 or len(options) < 2:
+            if not severe_mismatch:
+                return None
+            clarification_questions = [
+                "The current indicator match may be wrong for your request.",
+                f"Current match: {current_label}",
+                mismatch_hint,
+                "Please reply with the exact indicator name or code you want (for example, NE.IMP.GNFS.ZS).",
+            ]
+            return QueryResponse(
+                conversationId=conversation_id,
+                intent=intent,
+                clarificationNeeded=True,
+                clarificationQuestions=clarification_questions,
+                processingSteps=processing_steps,
+            )
 
         clarification_questions = [
             "I found multiple plausible indicators and the current match is uncertain.",
             f"Current match: {current_label}",
-            "Please choose one option:",
         ]
+        if mismatch_hint:
+            clarification_questions.append(mismatch_hint)
+        clarification_questions.append("Please choose one option:")
         clarification_questions.extend(
             f"{idx}. {option}" for idx, option in enumerate(options, start=1)
         )
@@ -2274,6 +2514,58 @@ class QueryService:
             clarificationQuestions=clarification_questions,
             processingSteps=processing_steps,
         )
+
+    def _build_indicator_mismatch_hint(self, query: str, top_series: Any) -> Optional[str]:
+        """Generate a concise mismatch explanation for uncertain indicator matches."""
+        if top_series is None:
+            return None
+
+        query_cues = self._extract_indicator_cues(query)
+        top_series_cues = self._extract_indicator_cues(self._series_text_for_relevance(top_series))
+        high_signal_query_cues = {
+            cue for cue in query_cues
+            if cue not in {"gdp", "tenor_2y", "tenor_10y", "tenor_30y", "discontinued"}
+        }
+
+        query_direction = self._single_directional_cue(high_signal_query_cues)
+        if query_direction and self._has_directional_conflict(high_signal_query_cues, top_series_cues):
+            opposite = "exports" if query_direction == "import" else "imports"
+            return (
+                f"Potential mismatch: your query asks for {query_direction}s, "
+                f"but the current match appears closer to {opposite}."
+            )
+
+        if high_signal_query_cues and not (high_signal_query_cues & top_series_cues):
+            cue_labels = {
+                "import": "imports",
+                "export": "exports",
+                "trade_balance": "trade balance",
+                "trade_openness": "trade openness",
+                "debt_gdp_ratio": "debt-to-GDP ratio",
+                "public_debt": "public debt",
+                "debt_service": "debt service",
+                "gdp_deflator": "GDP deflator",
+                "hicp": "HICP",
+                "producer_price": "producer prices",
+                "real_effective_exchange_rate": "real effective exchange rate",
+                "bond_yield": "bond yields",
+                "policy_rate": "policy rate",
+                "money_supply": "money supply",
+                "house_prices": "house prices",
+                "current_account": "current account",
+                "reserves": "foreign-exchange reserves",
+            }
+            readable = [
+                cue_labels.get(cue, cue.replace("_", " "))
+                for cue in sorted(high_signal_query_cues)
+            ]
+            if readable:
+                return (
+                    "Potential mismatch: the current match does not clearly reflect "
+                    f"your requested concept ({', '.join(readable[:3])})."
+                )
+
+        return None
 
     def _build_no_data_indicator_clarification(
         self,
@@ -5043,6 +5335,14 @@ class QueryService:
                             indicator_query=indicator_query,
                             resolved_source=resolved.source,
                         )
+                        relevance_threshold = self._minimum_resolved_relevance_threshold(
+                            indicator_query,
+                        )
+                        resolved_relevance = self._score_resolved_indicator_relevance(
+                            indicator_query=indicator_query,
+                            provider=provider,
+                            resolved=resolved,
+                        )
                         accepted_resolved = resolved.confidence >= threshold
                         if accepted_resolved and not self._is_resolved_indicator_plausible(
                             provider=provider,
@@ -5050,13 +5350,20 @@ class QueryService:
                             resolved_code=resolved.code,
                         ):
                             accepted_resolved = False
+                        if accepted_resolved and resolved_relevance < relevance_threshold:
+                            accepted_resolved = False
                         logger.info(
-                            "🔍 IndicatorResolver candidate: '%s' → '%s' (conf=%.2f, src=%s, threshold=%.2f, accepted=%s)",
+                            (
+                                "🔍 IndicatorResolver candidate: '%s' → '%s' "
+                                "(conf=%.2f, src=%s, threshold=%.2f, relevance=%.2f, min_relevance=%.2f, accepted=%s)"
+                            ),
                             indicator_query,
                             resolved.code,
                             resolved.confidence,
                             resolved.source,
                             threshold,
+                            resolved_relevance,
+                            relevance_threshold,
                             accepted_resolved,
                         )
 

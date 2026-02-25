@@ -769,7 +769,7 @@ class QueryServiceTests(unittest.TestCase):
         self.assertIn("IMF", joined)
         self.assertIn("WorldBank", joined)
 
-    def test_build_uncertain_result_clarification_skips_incompatible_canonical_provider_option(self) -> None:
+    def test_build_uncertain_result_clarification_requests_explicit_indicator_when_only_match_is_incompatible(self) -> None:
         intent = ParsedIntent(
             apiProvider="WORLDBANK",
             indicators=["trade openness ratio (exports plus imports to GDP)"],
@@ -816,7 +816,12 @@ class QueryServiceTests(unittest.TestCase):
                 processing_steps=None,
             )
 
-        self.assertIsNone(clarification)
+        self.assertIsNotNone(clarification)
+        assert clarification is not None
+        self.assertTrue(clarification.clarificationNeeded)
+        joined = "\n".join(clarification.clarificationQuestions or []).lower()
+        self.assertIn("may be wrong", joined)
+        self.assertIn("exact indicator", joined)
 
     def test_build_no_data_indicator_clarification_returns_options(self) -> None:
         conv_id = conversation_manager.get_or_create("conv-no-data-clar")
@@ -1245,6 +1250,162 @@ class QueryServiceTests(unittest.TestCase):
             resolved_source="database",
         )
         self.assertLessEqual(threshold, 0.68)
+
+    def test_minimum_resolved_relevance_threshold_is_strict_for_directional_ratio_queries(self) -> None:
+        min_relevance = self.service._minimum_resolved_relevance_threshold(  # pylint: disable=protected-access
+            "import share of gdp in china and us"
+        )
+        self.assertGreaterEqual(min_relevance, 0.45)
+
+    def test_minimum_resolved_relevance_threshold_is_permissive_for_generic_queries(self) -> None:
+        min_relevance = self.service._minimum_resolved_relevance_threshold(  # pylint: disable=protected-access
+            "gdp growth"
+        )
+        self.assertLessEqual(min_relevance, -0.30)
+
+    def test_specific_cues_compatible_rejects_directional_conflict(self) -> None:
+        compatible = self.service._specific_cues_compatible(  # pylint: disable=protected-access
+            {"import"},
+            {"export"},
+        )
+        self.assertFalse(compatible)
+
+        trade_balance_compatible = self.service._specific_cues_compatible(  # pylint: disable=protected-access
+            {"import"},
+            {"trade_balance"},
+        )
+        self.assertFalse(trade_balance_compatible)
+
+    def test_score_series_relevance_prefers_directional_ratio_match_over_generic_ratio(self) -> None:
+        query = "import share of gdp in china and us"
+        generic_ratio_series = NormalizedData.model_validate(
+            {
+                "metadata": {
+                    "source": "WorldBank",
+                    "indicator": "Gross domestic savings (% of GDP)",
+                    "country": "China",
+                    "frequency": "annual",
+                    "unit": "% of GDP",
+                    "lastUpdated": "2024-01-01",
+                    "seriesId": "NY.GNS.ICTR.ZS",
+                    "apiUrl": "https://example.com",
+                },
+                "data": [{"date": "2023-01-01", "value": 44.1}],
+            }
+        )
+        directional_ratio_series = NormalizedData.model_validate(
+            {
+                "metadata": {
+                    "source": "WorldBank",
+                    "indicator": "Imports of goods and services (% of GDP)",
+                    "country": "China",
+                    "frequency": "annual",
+                    "unit": "% of GDP",
+                    "lastUpdated": "2024-01-01",
+                    "seriesId": "NE.IMP.GNFS.ZS",
+                    "apiUrl": "https://example.com",
+                },
+                "data": [{"date": "2023-01-01", "value": 18.2}],
+            }
+        )
+
+        generic_score = self.service._score_series_relevance(query, generic_ratio_series)  # pylint: disable=protected-access
+        directional_score = self.service._score_series_relevance(query, directional_ratio_series)  # pylint: disable=protected-access
+        self.assertGreater(directional_score, generic_score + 2.0)
+
+    def test_build_uncertain_result_clarification_asks_explicit_indicator_on_severe_mismatch(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="WORLDBANK",
+            indicators=["imports as % of GDP"],
+            parameters={"countries": ["China", "US"]},
+            clarificationNeeded=False,
+            originalQuery="import share of gdp in china and us",
+        )
+        uncertain_data = [
+            NormalizedData.model_validate(
+                {
+                    "metadata": {
+                        "source": "WorldBank",
+                        "indicator": "Exports of goods and services (% of GDP)",
+                        "country": "China",
+                        "frequency": "annual",
+                        "unit": "% of GDP",
+                        "lastUpdated": "2024-01-01",
+                        "seriesId": "NE.EXP.GNFS.ZS",
+                        "apiUrl": "https://example.com",
+                    },
+                    "data": [{"date": "2023-01-01", "value": 20.0}],
+                }
+            )
+        ]
+
+        class _Resolver:
+            def resolve(self, *args, **kwargs):
+                return None
+
+        with patch.object(self.service, "_needs_indicator_clarification", return_value=True), \
+             patch.object(self.service, "_collect_indicator_choice_options", return_value=[]), \
+             patch("backend.services.query.get_indicator_resolver", return_value=_Resolver()):
+            clarification = self.service._build_uncertain_result_clarification(  # pylint: disable=protected-access
+                conversation_id="conv-severe-mismatch",
+                query="import share of gdp in china and us",
+                intent=intent,
+                data=uncertain_data,
+            )
+
+        self.assertIsNotNone(clarification)
+        assert clarification is not None
+        self.assertTrue(clarification.clarificationNeeded)
+        joined = "\n".join(clarification.clarificationQuestions or []).lower()
+        self.assertIn("may be wrong", joined)
+        self.assertIn("exact indicator", joined)
+
+    def test_fetch_data_rejects_high_confidence_but_low_relevance_resolved_code(self) -> None:
+        intent = ParsedIntent(
+            apiProvider="WorldBank",
+            indicators=["imports share of gdp"],
+            parameters={"countries": ["China", "US"]},
+            clarificationNeeded=False,
+            originalQuery="import share of gdp in china and us",
+        )
+
+        class _Resolved:
+            def __init__(self):
+                self.code = "NY.GDP.MKTP.CD"
+                self.confidence = 0.95
+                self.source = "database"
+                self.name = "GDP (current US$)"
+                self.provider = "WORLDBANK"
+
+        class _Resolver:
+            def resolve(self, *args, **kwargs):
+                return _Resolved()
+
+        with patch("backend.services.query.get_indicator_resolver", return_value=_Resolver()), \
+             patch.object(self.service, "_select_indicator_query_for_resolution", return_value="imports as % of GDP"), \
+             patch.object(self.service, "_get_from_cache", return_value=None), \
+             patch.object(self.service.world_bank_provider, "fetch_indicator", return_value=[sample_series()]) as fetch_mock:
+            run(self.service._fetch_data(intent))  # pylint: disable=protected-access
+
+        self.assertEqual(fetch_mock.call_args.kwargs.get("indicator"), "imports as % of GDP")
+
+    def test_code_semantic_hint_infers_worldbank_import_ratio_cues(self) -> None:
+        hint = self.service._code_semantic_hint(  # pylint: disable=protected-access
+            "WORLDBANK",
+            "NE.IMP.GNFS.ZS",
+        )
+        hint_lower = hint.lower()
+        self.assertIn("imports", hint_lower)
+        self.assertIn("share of gdp", hint_lower)
+
+    def test_code_semantic_hint_infers_fred_tenor_cues(self) -> None:
+        hint = self.service._code_semantic_hint(  # pylint: disable=protected-access
+            "FRED",
+            "DGS10",
+        )
+        hint_lower = hint.lower()
+        self.assertIn("10-year", hint_lower)
+        self.assertIn("treasury yield", hint_lower)
 
     def test_eurostat_fetch_prefers_resolved_indicator_param(self) -> None:
         intent = ParsedIntent(
